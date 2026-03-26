@@ -2,6 +2,12 @@
 
 Works with any CTM instance — ImageNet, maze, QA, or custom tasks.
 Only requires track=True forward pass.
+
+Key distinction this analysis makes:
+  - "Dead neuron" = low WEIGHT norm (truly unused capacity, architecture waste)
+  - "Inactive neuron" = low activation on THIS input (sparse activation, expected)
+  - "Synapse capacity" = weight matrix rank (what it CAN express)
+  - "Synapse utilization" = activation rank (what it DOES express on this input)
 """
 
 import numpy as np
@@ -14,11 +20,18 @@ from typing import Dict, List, Optional, Any
 @dataclass
 class BoundResults:
     """Complete bound analysis results for a CTM on one input."""
-    # Per-neuron analysis
-    neuron_gaps: np.ndarray           # [D] gap per neuron
+    # Per-neuron analysis (weights — architecture capacity)
+    neuron_weight_norms: np.ndarray   # [D] NLM weight L2 norm per neuron
+    neuron_diversity: float           # mean pairwise cosine sim (0=diverse, 1=collapsed)
+    dead_neurons: List[int]           # truly dead: low weight norm (not just inactive)
+    n_dead: int                       # count of dead neurons
+
+    # Per-neuron analysis (activations — this-input behavior)
+    neuron_act_energy: np.ndarray     # [D] activation energy on this input
+    inactive_neurons: List[int]       # inactive on THIS input (sparse activation)
+    n_inactive: int                   # count of inactive neurons
     neuron_contributions: np.ndarray  # [D] fraction of total Jacobian energy
     neuron_effective_ranks: np.ndarray  # [D] effective rank of NLM Jacobian
-    dead_neurons: List[int]           # indices of neurons with ~zero contribution
 
     # Per-tick analysis
     tick_losses: np.ndarray           # [T] loss at each tick
@@ -28,20 +41,117 @@ class BoundResults:
     best_tick: int                    # tick with lowest loss
     overthinking_ticks: List[int]     # ticks where loss increased
 
-    # Synapse analysis
-    synapse_achieved: float           # current synapse residual
-    synapse_optimal: float            # best achievable with optimal shared W
-    synapse_gap: float                # achieved - optimal
+    # Synapse analysis — separate capacity (weights) from utilization (activations)
+    synapse_weight_rank_90: int       # effective rank of W at 90% energy
+    synapse_weight_rank_99: int       # effective rank of W at 99% energy
+    synapse_weight_dims: tuple        # (rows, cols) of synapse weight matrix
+    synapse_activation_rank: int      # effective rank of activations flowing through
+    synapse_utilization_pct: float    # activation_rank / weight_rank * 100
+    synapse_top_svs: list             # top 5 singular values of weight matrix
+    synapse_condition: float          # condition number of weight matrix
+
+    # Global
+    synapse_gap: float                # achieved - optimal residual
     synapse_gap_pct: float            # gap as percentage
-    input_effective_rank: int         # effective dimensionality of synapse input
-    output_effective_rank: int        # effective dimensionality of synapse output
-    synapse_condition_numbers: np.ndarray  # [T] condition number per tick
-    bottleneck: str                   # 'input', 'output', or 'balanced'
+    bottleneck: str                   # what limits performance
 
     # Summary
     model_dim: int
     n_ticks: int
     n_synapse_params: int
+
+
+def _get_nlm_weight_norms(model):
+    """Extract per-neuron NLM weight norms from model parameters.
+
+    Handles both SuperLinear (w1 shaped [in, hidden, N]) and standard Linear.
+    Returns array of shape [D] with L2 norm per neuron, or None if not found.
+    """
+    norms = None
+    for name, param in model.named_parameters():
+        if 'trace_processor' not in name or 'weight' not in name.split('.')[-1]:
+            # Also check for SuperLinear's 'w1' parameter
+            if 'trace_processor' not in name or 'w1' not in name.split('.')[-1]:
+                continue
+
+        w = param.detach().cpu()
+        if w.dim() == 3:
+            # SuperLinear: could be [in, out, N] or [N, in, out]
+            # Figure out which dim is neurons (D = d_model)
+            D = model.d_model
+            if w.shape[0] == D:
+                per_neuron = w.reshape(D, -1).norm(dim=1)
+            elif w.shape[2] == D:
+                per_neuron = w.reshape(-1, D).norm(dim=0)
+            elif w.shape[1] == D:
+                per_neuron = w.permute(1, 0, 2).reshape(D, -1).norm(dim=1)
+            else:
+                continue
+
+            if norms is None:
+                norms = per_neuron.numpy()
+            else:
+                norms = norms + per_neuron.numpy()
+
+    return norms
+
+
+def _get_nlm_diversity(model):
+    """Compute pairwise cosine similarity between neuron NLM weights.
+
+    Returns mean cosine similarity: 0 = fully diverse, 1 = all identical.
+    """
+    # Find the largest NLM weight tensor
+    best_w = None
+    for name, param in model.named_parameters():
+        if 'trace_processor' not in name:
+            continue
+        if 'w1' in name.split('.')[-1] or 'weight' in name.split('.')[-1]:
+            w = param.detach().cpu()
+            if w.dim() == 3 and (best_w is None or w.numel() > best_w.numel()):
+                best_w = w
+
+    if best_w is None:
+        return 0.0
+
+    D = model.d_model
+    # Reshape so each neuron is a row
+    if best_w.shape[2] == D:
+        vectors = best_w.reshape(-1, D).T  # [D, features]
+    elif best_w.shape[0] == D:
+        vectors = best_w.reshape(D, -1)    # [D, features]
+    else:
+        return 0.0
+
+    # Normalize
+    vectors = vectors / (vectors.norm(dim=1, keepdim=True) + 1e-8)
+
+    # Pairwise cosine (upper triangle)
+    cos = vectors @ vectors.T
+    mask = torch.triu(torch.ones(D, D, dtype=torch.bool), diagonal=1)
+    return float(cos[mask].mean().abs())
+
+
+def _get_synapse_weight_info(model):
+    """Extract synapse weight matrix and compute rank/SVD info."""
+    for name, param in model.synapses.named_parameters():
+        if 'weight' in name and param.dim() == 2:
+            w = param.detach().cpu().float()
+            svs = torch.linalg.svdvals(w)
+            total = svs.sum()
+            cumsum = svs.cumsum(0) / total
+            rank_90 = int((cumsum < 0.9).sum().item()) + 1
+            rank_99 = int((cumsum < 0.99).sum().item()) + 1
+            condition = float(svs[0] / (svs[-1] + 1e-10))
+            return {
+                'dims': (w.shape[0], w.shape[1]),
+                'rank_90': rank_90,
+                'rank_99': rank_99,
+                'condition': condition,
+                'top_svs': svs[:5].tolist(),
+                'n_params': w.numel(),
+            }
+    return None
 
 
 def analyze_ctm(model, x, device=None):
@@ -56,7 +166,10 @@ def analyze_ctm(model, x, device=None):
         BoundResults with per-neuron, per-tick, and synapse diagnostics
     """
     if device is None:
-        device = x.device if hasattr(x, 'device') else 'cpu'
+        if isinstance(x, dict):
+            device = next(iter(x.values())).device
+        else:
+            device = x.device if hasattr(x, 'device') else 'cpu'
 
     model.eval()
     model = model.to(device)
@@ -67,39 +180,51 @@ def analyze_ctm(model, x, device=None):
 
     D = model.d_model
     T = model.iterations
+    eps = 1e-8
 
     # ─── Forward pass with tracking ──────────────────────────────────
     with torch.no_grad():
         out = model(x, track=True)
 
-    predictions = out[0]   # [B, out_dim, T]
-    pre_act = out[3]       # [T, B, D] or np array
-    post_act = out[4]      # [T, B, D] or np array
+    predictions = out[0]
+    pre_act = out[3]
+    post_act = out[4]
 
     if isinstance(pre_act, torch.Tensor):
         pre_act = pre_act.cpu().numpy()
     if isinstance(post_act, torch.Tensor):
         post_act = post_act.cpu().numpy()
 
-    # Take first sample
     pre_act = pre_act[:, 0, :]   # [T, D]
     post_act = post_act[:, 0, :]  # [T, D]
 
-    # ─── Per-neuron NLM analysis ─────────────────────────────────────
-    # Approximate NLM Jacobian: J_d^t ≈ post_act / pre_act (diagonal)
-    eps = 1e-8
+    # ─── Per-neuron: WEIGHT analysis (architecture capacity) ─────────
+    weight_norms = _get_nlm_weight_norms(model)
+    if weight_norms is None:
+        weight_norms = np.ones(D)
+
+    neuron_diversity = _get_nlm_diversity(model)
+
+    # Truly dead = weight norm below 10% of mean
+    mean_wn = weight_norms.mean()
+    dead_neurons = list(np.where(weight_norms < mean_wn * 0.1)[0])
+
+    # ─── Per-neuron: ACTIVATION analysis (this-input behavior) ───────
+    neuron_act_energy = np.sum(post_act ** 2, axis=0)  # [D]
+    act_threshold = np.percentile(neuron_act_energy, 25)
+    inactive_neurons = list(np.where(neuron_act_energy < act_threshold * 0.01)[0])
+
+    # Jacobian-based contribution
     nlm_jac = np.where(
         np.abs(pre_act) > eps,
         post_act / (pre_act + np.sign(pre_act) * eps),
         1.0
-    )  # [T, D]
-
-    # Per-neuron Jacobian energy
-    neuron_jac_energy = np.sum(nlm_jac ** 2, axis=0)  # [D]
+    )
+    neuron_jac_energy = np.sum(nlm_jac ** 2, axis=0)
     total_jac_energy = neuron_jac_energy.sum()
     neuron_contributions = neuron_jac_energy / (total_jac_energy + eps)
 
-    # Per-neuron effective rank (entropy of normalized |J| across ticks)
+    # Effective rank per neuron
     neuron_eff_ranks = np.zeros(D)
     for d in range(D):
         jac_abs = np.abs(nlm_jac[:, d])
@@ -108,34 +233,25 @@ def analyze_ctm(model, x, device=None):
             p = jac_abs / s
             neuron_eff_ranks[d] = np.exp(-np.sum(p * np.log(p + 1e-12)))
 
-    # Per-neuron gap (proxy: contribution × loss)
-    pred_np = predictions[0, 0, :].detach().cpu().numpy()  # [T]
-    final_loss = pred_np[-1] ** 2  # MSE against 0 (no target available)
-    neuron_gaps = neuron_contributions * final_loss
-
-    # Dead neurons: low contribution AND low activation
-    act_energy_per_neuron = np.sum(post_act ** 2, axis=0)  # [D]
-    act_threshold = np.percentile(act_energy_per_neuron, 10)
-    dead_neurons = list(np.where(
-        (neuron_contributions < 1.0 / D * 0.1) &
-        (act_energy_per_neuron < act_threshold)
-    )[0])
-
     # ─── Per-tick analysis ───────────────────────────────────────────
-    tick_losses = pred_np ** 2  # [T]
+    pred_np = predictions[0, 0, :].detach().cpu().numpy()
+    tick_losses = pred_np ** 2
     tick_improvements = np.zeros(T)
     tick_improvements[1:] = tick_losses[:-1] - tick_losses[1:]
 
-    tick_jac_energy = np.sum(nlm_jac ** 2, axis=1)  # [T]
-    tick_act_energy = np.sum(post_act ** 2, axis=1)  # [T]
+    tick_jac_energy = np.sum(nlm_jac ** 2, axis=1)
+    tick_act_energy = np.sum(post_act ** 2, axis=1)
 
     best_tick = int(np.argmin(tick_losses))
     overthinking_ticks = list(np.where(tick_improvements < -0.01 * tick_losses.max())[0])
 
-    # ─── Synapse analysis (improved characterization §3.1) ───────────
-    syn_inputs_list = []
-    syn_outputs_list = []
+    # ─── Synapse: WEIGHT analysis (capacity) ─────────────────────────
+    syn_info = _get_synapse_weight_info(model)
+    if syn_info is None:
+        syn_info = {'dims': (0, 0), 'rank_90': 0, 'rank_99': 0,
+                    'condition': 0, 'top_svs': [], 'n_params': 0}
 
+    # ─── Synapse: ACTIVATION analysis (utilization) ──────────────────
     captured = {'in': [], 'out': []}
     def hook(module, inp, out):
         captured['in'].append(inp[0].detach().cpu())
@@ -143,100 +259,80 @@ def analyze_ctm(model, x, device=None):
 
     handle = model.synapses.register_forward_hook(hook)
     with torch.no_grad():
-        if isinstance(x, dict):
-            model(x)
-        else:
-            model(x)
+        model(x)
     handle.remove()
 
     if captured['in']:
-        syn_in = np.array([t[0].numpy() for t in captured['in']])   # [T, d_in]
-        syn_out = np.array([t[0].numpy() for t in captured['out']])  # [T, D]
-        d_in = syn_in.shape[1]
+        syn_in = np.array([t[0].numpy() for t in captured['in']])
+        syn_out = np.array([t[0].numpy() for t in captured['out']])
 
-        # Compute synapse Jacobian SVD per tick
-        syn_condition = np.zeros(T)
-        for t in range(min(T, len(captured['in']))):
-            inp_t = torch.tensor(syn_in[t:t+1], dtype=torch.float32).to(device)
-            # Numerical Jacobian (sample a few random directions for speed)
-            n_probe = min(32, d_in)
-            probe_idx = np.random.choice(d_in, n_probe, replace=False)
-            jac_cols = np.zeros((D, n_probe))
-            base_out = model.synapses(inp_t).detach().cpu().numpy()[0]
-            for k, j in enumerate(probe_idx):
-                perturbed = inp_t.clone()
-                perturbed[0, j] += 1e-4
-                jac_cols[:, k] = (model.synapses(perturbed).detach().cpu().numpy()[0] - base_out) / 1e-4
-            S = np.linalg.svd(jac_cols, compute_uv=False)
-            syn_condition[t] = S[0] / (S[-1] + 1e-10) if len(S) > 0 else 0
+        # Activation effective rank (what the synapse actually uses)
+        _, S_in, _ = np.linalg.svd(syn_in, full_matrices=False)
+        act_eff_rank = int(np.sum(S_in > S_in[0] * 0.01))
 
-        # Optimal shared W: solve least squares across all ticks
-        # W_opt = (Σ_t out_t ⊗ in_t) @ pinv(Σ_t in_t ⊗ in_t)
+        # Optimal shared W residual
         A_cross = sum(np.outer(syn_out[t], syn_in[t]) for t in range(len(syn_in)))
         B_inp = sum(np.outer(syn_in[t], syn_in[t]) for t in range(len(syn_in)))
-
         try:
             W_opt = A_cross @ np.linalg.pinv(B_inp)
             optimal_resid = sum(
-                np.sum((syn_out[t] - W_opt @ syn_in[t]) ** 2)
-                for t in range(len(syn_in))
-            )
+                np.sum((syn_out[t] - W_opt @ syn_in[t]) ** 2) for t in range(len(syn_in)))
+            achieved_resid = sum(np.sum(syn_out[t] ** 2) for t in range(len(syn_in)))
+            synapse_gap = achieved_resid - optimal_resid
+            synapse_gap_pct = synapse_gap / (achieved_resid + eps) * 100
         except np.linalg.LinAlgError:
-            optimal_resid = 0.0
-
-        achieved_resid = sum(np.sum(syn_out[t] ** 2) for t in range(len(syn_in)))
-        # Actually: achieved residual = ||out - W_current · in||^2
-        # But we don't have W_current separately. Use linearization error.
-        # The Jacobian-based residual is a proxy.
-        syn_jac_resid = 0.0
-        for t in range(min(T, len(syn_in))):
-            predicted = np.zeros(D)  # would need full Jacobian
-            syn_jac_resid += np.sum((syn_out[t] - predicted) ** 2) if False else 0
-
-        # Input/output effective rank
-        _, S_in, _ = np.linalg.svd(syn_in, full_matrices=False)
-        inp_eff_rank = int(np.sum(S_in > S_in[0] * 0.01))
-        _, S_out, _ = np.linalg.svd(syn_out, full_matrices=False)
-        out_eff_rank = int(np.sum(S_out > S_out[0] * 0.01))
-
-        synapse_gap = achieved_resid - optimal_resid
-        synapse_gap_pct = synapse_gap / (achieved_resid + eps) * 100
-        n_syn_params = D * d_in
-        bottleneck = 'input' if inp_eff_rank < out_eff_rank else (
-            'output' if out_eff_rank < inp_eff_rank else 'balanced')
+            act_eff_rank = 0
+            synapse_gap = 0
+            synapse_gap_pct = 0
     else:
-        achieved_resid = 0.0
-        optimal_resid = 0.0
-        synapse_gap = 0.0
-        synapse_gap_pct = 0.0
-        inp_eff_rank = 0
-        out_eff_rank = 0
-        syn_condition = np.zeros(T)
-        n_syn_params = 0
-        bottleneck = 'unknown'
+        act_eff_rank = 0
+        synapse_gap = 0
+        synapse_gap_pct = 0
+
+    # Utilization: how much of the synapse capacity is actually used
+    utilization = act_eff_rank / (syn_info['rank_90'] + eps) * 100
+
+    # Bottleneck determination
+    if len(dead_neurons) > D * 0.3:
+        bottleneck = 'dead_neurons'
+    elif utilization < 10:
+        bottleneck = 'upstream (low activation rank through synapse)'
+    elif syn_info['condition'] > 500:
+        bottleneck = 'synapse conditioning (ill-conditioned weight matrix)'
+    elif len(overthinking_ticks) > T * 0.3:
+        bottleneck = 'overthinking (too many ticks)'
+    else:
+        bottleneck = 'none detected'
 
     return BoundResults(
-        neuron_gaps=neuron_gaps,
+        neuron_weight_norms=weight_norms,
+        neuron_diversity=neuron_diversity,
+        dead_neurons=dead_neurons,
+        n_dead=len(dead_neurons),
+        neuron_act_energy=neuron_act_energy,
+        inactive_neurons=inactive_neurons,
+        n_inactive=len(inactive_neurons),
         neuron_contributions=neuron_contributions,
         neuron_effective_ranks=neuron_eff_ranks,
-        dead_neurons=dead_neurons,
         tick_losses=tick_losses,
         tick_improvements=tick_improvements,
         tick_jac_energy=tick_jac_energy,
         tick_act_energy=tick_act_energy,
         best_tick=best_tick,
         overthinking_ticks=overthinking_ticks,
-        synapse_achieved=achieved_resid,
-        synapse_optimal=optimal_resid,
+        synapse_weight_rank_90=syn_info['rank_90'],
+        synapse_weight_rank_99=syn_info['rank_99'],
+        synapse_weight_dims=syn_info['dims'],
+        synapse_activation_rank=act_eff_rank,
+        synapse_utilization_pct=utilization,
+        synapse_top_svs=syn_info['top_svs'],
+        synapse_condition=syn_info['condition'],
         synapse_gap=synapse_gap,
         synapse_gap_pct=synapse_gap_pct,
-        input_effective_rank=inp_eff_rank,
-        output_effective_rank=out_eff_rank,
-        synapse_condition_numbers=syn_condition,
         bottleneck=bottleneck,
         model_dim=D,
         n_ticks=T,
-        n_synapse_params=n_syn_params,
+        n_synapse_params=syn_info['n_params'],
     )
 
 
@@ -251,64 +347,77 @@ def print_report(results: BoundResults):
     print("=" * 60)
     print(f"Architecture: {D} neurons, {T} ticks, {results.n_synapse_params:,} synapse params")
 
-    # Neurons
-    print(f"\n--- Per-neuron (NLM) bounds ---")
-    print(f"  Mean gap:     {results.neuron_gaps.mean():.6f}")
-    print(f"  Max gap:      {results.neuron_gaps.max():.6f} (neuron {results.neuron_gaps.argmax()})")
-    print(f"  Dead neurons: {len(results.dead_neurons)}/{D} ({len(results.dead_neurons)/D*100:.0f}%)")
-    print(f"  Mean eff rank: {results.neuron_effective_ranks.mean():.1f}/{T}")
+    # Neurons — weights (capacity)
+    print(f"\n--- Neuron capacity (NLM weights) ---")
+    wn = results.neuron_weight_norms
+    print(f"  Weight norms: min={wn.min():.3f} mean={wn.mean():.3f} max={wn.max():.3f}")
+    print(f"  Dead neurons (low weight):  {results.n_dead}/{D}")
+    print(f"  Diversity (cosine sim):     {results.neuron_diversity:.4f} "
+          f"({'diverse' if results.neuron_diversity < 0.1 else 'some collapse' if results.neuron_diversity < 0.5 else 'collapsed'})")
 
-    # Top contributors
+    # Neurons — activations (this input)
+    print(f"\n--- Neuron activation (this input) ---")
+    print(f"  Inactive on this input: {results.n_inactive}/{D} (sparse activation)")
     top5 = np.argsort(results.neuron_contributions)[-5:][::-1]
     print(f"  Top contributors: {[(int(i), f'{results.neuron_contributions[i]:.3f}') for i in top5]}")
+    print(f"  Mean eff rank: {results.neuron_effective_ranks.mean():.1f}/{T}")
 
     # Ticks
-    print(f"\n--- Per-tick bounds ---")
-    print(f"  Best tick:       {results.best_tick} (loss={results.tick_losses[results.best_tick]:.4f})")
-    print(f"  Final tick loss: {results.tick_losses[-1]:.4f}")
+    print(f"\n--- Per-tick thinking trajectory ---")
+    print(f"  Best tick:    {results.best_tick} (loss={results.tick_losses[results.best_tick]:.4f})")
+    print(f"  Final tick:   loss={results.tick_losses[-1]:.4f}")
     if results.overthinking_ticks:
-        print(f"  Overthinking:    ticks {results.overthinking_ticks}")
+        print(f"  Overthinking: ticks {results.overthinking_ticks}")
     else:
-        print(f"  Overthinking:    none (loss monotonically decreases)")
-    print(f"  Improvement trajectory (first 5): {[f'{x:.4f}' for x in results.tick_improvements[:5]]}")
-    print(f"  Jac energy trajectory (first 5):  {[f'{x:.1f}' for x in results.tick_jac_energy[:5]]}")
+        print(f"  Overthinking: none")
+    imp = results.tick_improvements
+    print(f"  Improvement:  first3=[{', '.join(f'{x:.4f}' for x in imp[:3])}] "
+          f"last3=[{', '.join(f'{x:.4f}' for x in imp[-3:])}]")
 
-    # Synapse
-    print(f"\n--- Synapse bounds (§3.1 improved characterization) ---")
-    print(f"  Achieved residual: {results.synapse_achieved:.4f}")
-    print(f"  Optimal residual:  {results.synapse_optimal:.4f}")
-    print(f"  Gap:               {results.synapse_gap:.4f} ({results.synapse_gap_pct:.1f}%)")
-    print(f"  Input eff rank:    {results.input_effective_rank}")
-    print(f"  Output eff rank:   {results.output_effective_rank}")
-    print(f"  Bottleneck:        {results.bottleneck}")
-    cond = results.synapse_condition_numbers
-    print(f"  Condition numbers: mean={cond.mean():.0f} max={cond.max():.0f}")
+    # Synapse — separate capacity from utilization
+    print(f"\n--- Synapse analysis (§3.1) ---")
+    print(f"  Weight matrix:     {results.synapse_weight_dims}")
+    print(f"  Weight rank (90%): {results.synapse_weight_rank_90} (capacity)")
+    print(f"  Weight rank (99%): {results.synapse_weight_rank_99}")
+    print(f"  Activation rank:   {results.synapse_activation_rank} (utilization)")
+    print(f"  Utilization:       {results.synapse_utilization_pct:.1f}% "
+          f"(activation rank / weight rank)")
+    print(f"  Condition number:  {results.synapse_condition:.0f}")
+    if results.synapse_top_svs:
+        print(f"  Top singular vals: {[f'{s:.2f}' for s in results.synapse_top_svs]}")
 
-    # Recommendations
-    print(f"\n--- Recommendations ---")
-    if len(results.dead_neurons) > D * 0.5:
-        print(f"  ! {len(results.dead_neurons)} dead neurons ({len(results.dead_neurons)/D*100:.0f}%) — "
-              f"model is severely underutilizing capacity. Consider smaller d_model or neuron reinitialization.")
-    elif len(results.dead_neurons) > D * 0.1:
-        print(f"  * {len(results.dead_neurons)} dead neurons — some capacity wasted. "
-              f"Reinitializing these may help.")
+    # Diagnosis
+    print(f"\n--- Diagnosis ---")
+    print(f"  Bottleneck: {results.bottleneck}")
 
-    if results.synapse_gap_pct > 50:
-        print(f"  ! Synapse gap {results.synapse_gap_pct:.0f}% — the communication backbone "
-              f"is the bottleneck, not the NLMs. Consider deeper synapse or better initialization.")
+    if results.n_dead > 0:
+        print(f"  ! {results.n_dead} truly dead neurons — wasted parameters. "
+              f"Consider smaller d_model or reinitializing.")
 
-    if results.input_effective_rank < D * 0.1:
-        print(f"  ! Input effective rank {results.input_effective_rank}/{D*5} — "
-              f"most input dimensions carry no signal. Consider projecting down before synapse.")
+    if results.n_dead == 0 and results.n_inactive > D * 0.5:
+        print(f"  * {results.n_inactive} neurons inactive on this input — "
+              f"this is sparse activation (normal/healthy). "
+              f"Different inputs activate different subsets.")
 
-    if results.overthinking_ticks:
-        n_ot = len(results.overthinking_ticks)
-        print(f"  * {n_ot} overthinking ticks detected — model gets worse after thinking more. "
-              f"Consider reducing T or adding early-exit regularization.")
+    if results.synapse_utilization_pct < 10:
+        print(f"  ! Synapse utilization {results.synapse_utilization_pct:.0f}% — "
+              f"the synapse has rank-{results.synapse_weight_rank_90} capacity but "
+              f"only rank-{results.synapse_activation_rank} activations flow through it. "
+              f"Bottleneck is UPSTREAM (attention/input projection).")
 
-    if cond.mean() > 100:
-        print(f"  * High condition number ({cond.mean():.0f}) — optimization landscape is ill-conditioned. "
-              f"Consider spectral normalization or preconditioning.")
+    if results.synapse_condition > 500:
+        print(f"  ! Condition number {results.synapse_condition:.0f} — "
+              f"ill-conditioned. Consider spectral normalization.")
 
-    if results.synapse_gap_pct < 5 and len(results.dead_neurons) < D * 0.1:
-        print(f"  ✓ Model appears well-optimized. Synapse near-optimal, most neurons active.")
+    if results.overthinking_ticks and len(results.overthinking_ticks) > T * 0.2:
+        print(f"  * Model overthinks on {len(results.overthinking_ticks)}/{T} ticks. "
+              f"Consider early-exit or reducing T.")
+
+    if results.neuron_diversity > 0.5:
+        print(f"  ! Neuron collapse: diversity={results.neuron_diversity:.2f}. "
+              f"Many neurons learned similar functions. Consider dropout or repulsion loss.")
+
+    if (results.n_dead == 0 and results.synapse_utilization_pct > 30
+            and not results.overthinking_ticks and results.neuron_diversity < 0.1):
+        print(f"  OK: Model appears healthy — diverse neurons, good synapse utilization, "
+              f"no overthinking.")

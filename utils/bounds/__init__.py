@@ -12,10 +12,11 @@ This maps directly to the physical design problem A(θ)z = b where:
     A(θ) = linearized recurrence
 
 The SDP dual gives LOWER BOUNDS on the best achievable loss, enabling:
-    - Per-neuron gap analysis (which NLMs are well-optimized?)
-    - Per-tick gap trajectory (where in the thinking process is optimization weakest?)
-    - Synapse capacity analysis (is the communication backbone a bottleneck?)
-    - Dead neuron detection (which neurons contribute nothing?)
+    - Per-neuron weight vs activation analysis (dead neurons vs sparse activation)
+    - Neuron diversity measurement (collapse detection)
+    - Per-tick thinking trajectory (overthinking detection)
+    - Synapse capacity vs utilization (weight rank vs activation rank)
+    - Bottleneck identification (upstream input, conditioning, architecture)
 
 Key theoretical result: CTM's per-neuron NLMs have PRIVATE weights, so the
 sufficient condition from §1.2 of the paper holds trivially. The improved
