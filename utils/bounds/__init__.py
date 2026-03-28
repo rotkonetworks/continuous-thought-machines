@@ -36,4 +36,10 @@ Usage:
 """
 
 from utils.bounds.core import analyze_ctm, print_report
-from utils.bounds.training import BoundGuidedLoss, analyze_thinking_quality
+from utils.bounds.training import BoundGuidedLoss, HebbianPlasticity, analyze_thinking_quality
+
+# Full SDP solver (requires cvxpy — optional dependency)
+try:
+    from utils.bounds.sdp import full_sdp_analysis, solve_per_neuron_sdp
+except ImportError:
+    pass  # cvxpy not installed — approximate bounds still work
