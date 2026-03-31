@@ -149,6 +149,7 @@ pub struct EvalState {
     pub logits_t10: Vec<f32>,     // [N × n_output]
     pub labels: Vec<u16>,         // [N]
     pub sync_pca: Vec<f32>,       // [N × 2]
+    pub thumbnails: Vec<u8>,      // [N × 64 × 64 × 3] RGB
     pub n_images: usize,
     pub n_synch: usize,
     pub n_output: usize,
@@ -173,6 +174,7 @@ impl EvalState {
         logits_t10: Vec<f32>,
         labels: Vec<u16>,
         sync_pca: Vec<f32>,
+        thumbnails: Vec<u8>,
         n_images: usize,
         n_synch: usize,
         n_output: usize,
@@ -188,7 +190,7 @@ impl EvalState {
         }
 
         Self {
-            sync_signals, logits_final, logits_t10, labels, sync_pca,
+            sync_signals, logits_final, logits_t10, labels, sync_pca, thumbnails,
             n_images, n_synch, n_output, class_names,
             base_correct,
             hebbian_correct: vec![false; n_images],

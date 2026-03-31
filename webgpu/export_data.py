@@ -98,6 +98,7 @@ def main():
     logits_final = []
     logits_t10 = []
     labels = []
+    thumbnails = []  # raw RGB bytes, 64x64x3
 
     for i, sample in enumerate(ds):
         if len(syncs) >= N_EXPORT and len(baseline_syncs) >= N_BASELINE:
@@ -107,7 +108,8 @@ def main():
         if il is None:
             continue
 
-        x = TRANSFORM(sample['image'].convert('RGB')).unsqueeze(0).to(DEVICE)
+        img = sample['image'].convert('RGB')
+        x = TRANSFORM(img).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             preds, _, sync = model(x)
 
@@ -118,6 +120,9 @@ def main():
             logits_final.append(preds[0, :, -1].cpu().numpy())
             logits_t10.append(preds[0, :, 9].cpu().numpy())
             labels.append(il)
+            # Save thumbnail as 64x64 RGB
+            thumb = img.resize((64, 64))
+            thumbnails.append(np.array(thumb, dtype=np.uint8))
 
         if (len(syncs) + len(baseline_syncs)) % 50 == 0:
             print(f"  {len(baseline_syncs)} baseline + {len(syncs)} eval...")
@@ -141,15 +146,42 @@ def main():
     baseline_sync.astype(np.float32).tofile(os.path.join(OUT_DIR, 'baseline_sync.bin'))
     np.array(labels, dtype=np.uint16).tofile(os.path.join(OUT_DIR, 'labels.bin'))
     pca_2d.tofile(os.path.join(OUT_DIR, 'sync_pca.bin'))
+    # Thumbnails: [N, 64, 64, 3] uint8 = 2.4MB for 200 images
+    np.array(thumbnails, dtype=np.uint8).tofile(os.path.join(OUT_DIR, 'thumbnails.bin'))
+
+    # Run bound analysis on first image for neuron/synapse diagnostics
+    print("Running bound analysis...")
+    from utils.bounds.core import analyze_ctm
+    x_diag = TRANSFORM(
+        load_dataset('zh-plus/tiny-imagenet', split='valid', streaming=True)
+        .__iter__().__next__()['image'].convert('RGB')
+    ).unsqueeze(0).to(DEVICE)
+    bounds = analyze_ctm(model, x_diag, device=DEVICE)
 
     metadata = {
         'n_images': N,
         'n_synch': n_synch,
         'n_output': n_out,
         'class_names': [c.split(',')[0] for c in IMAGENET_CLASSES],
+        'bounds': {
+            'synapse_rank_90': bounds.synapse_weight_rank_90,
+            'synapse_rank_99': bounds.synapse_weight_rank_99,
+            'synapse_activation_rank': bounds.synapse_activation_rank,
+            'synapse_utilization_pct': round(bounds.synapse_utilization_pct, 2),
+            'synapse_condition': round(bounds.synapse_condition, 1),
+            'synapse_top_svs': [round(s, 2) for s in bounds.synapse_top_svs],
+            'n_dead': bounds.n_dead,
+            'n_inactive': bounds.n_inactive,
+            'neuron_diversity': round(bounds.neuron_diversity, 4),
+            'best_tick': int(bounds.best_tick),
+            'n_overthinking': len(bounds.overthinking_ticks),
+            'n_ticks': bounds.n_ticks,
+            'model_dim': bounds.model_dim,
+            'bottleneck': bounds.bottleneck,
+        },
     }
     with open(os.path.join(OUT_DIR, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f)
+        json.dump(metadata, f, indent=2)
 
     # Report sizes
     total = 0

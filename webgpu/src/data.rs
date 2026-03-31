@@ -242,4 +242,25 @@ pub struct HebbianMetadata {
     pub n_synch: usize,
     pub n_output: usize,
     pub class_names: Vec<String>,
+    #[serde(default)]
+    pub bounds: Option<BoundsInfo>,
+}
+
+/// Bound analysis results from the pretrained model.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BoundsInfo {
+    pub synapse_rank_90: usize,
+    pub synapse_activation_rank: usize,
+    pub synapse_utilization_pct: f64,
+    pub synapse_condition: f64,
+    #[serde(default)]
+    pub synapse_top_svs: Vec<f64>,
+    pub n_dead: usize,
+    pub n_inactive: usize,
+    pub neuron_diversity: f64,
+    pub best_tick: usize,
+    pub n_overthinking: usize,
+    pub n_ticks: usize,
+    pub model_dim: usize,
+    pub bottleneck: String,
 }

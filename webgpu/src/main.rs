@@ -61,6 +61,7 @@ struct DebuggerState {
 struct HebbianState {
     engine: HebbianEngine,
     eval: EvalState,
+    bounds: Option<data::BoundsInfo>,
     use_t10: bool,
     animating: bool,
     animation_speed: usize,
@@ -87,6 +88,7 @@ impl HebbianState {
         weights_buf: &[u8],
         baseline_buf: &[u8],
         pca_buf: &[u8],
+        thumbnails_buf: &[u8],
         metadata_json: &str,
     ) -> Self {
         let meta: data::HebbianMetadata =
@@ -99,6 +101,7 @@ impl HebbianState {
         let output_weights = data::parse_f32_buffer(weights_buf);
         let baseline_sync = data::parse_f32_buffer(baseline_buf);
         let sync_pca = data::parse_f32_buffer(pca_buf);
+        let thumbnails = thumbnails_buf.to_vec();
 
         let engine = HebbianEngine::new(
             meta.n_synch, meta.n_output, baseline_sync, output_weights,
@@ -106,12 +109,17 @@ impl HebbianState {
 
         let eval = EvalState::new(
             sync_signals, logits_final, logits_t10, labels, sync_pca,
-            meta.n_images, meta.n_synch, meta.n_output, meta.class_names,
+            thumbnails, meta.n_images, meta.n_synch, meta.n_output, meta.class_names,
         );
+
+        // Don't auto-run — let user set params first
+        let mut eval = eval;
+        eval.dirty = false;
 
         Self {
             engine,
             eval,
+            bounds: meta.bounds,
             use_t10: false,
             animating: false,
             animation_speed: 5,
@@ -226,9 +234,14 @@ impl App {
             }
 
             ui.separator();
-            ui.heading("Playback");
+            ui.heading("Run");
 
-            if ui.button(if state.animating { "⏸ Pause" } else { "▶ Animate" }).clicked() {
+            if ui.button("▶ Run All (instant)").clicked() {
+                state.engine.reset();
+                state.eval.dirty = true;
+            }
+
+            if ui.button(if state.animating { "⏸ Pause" } else { "▶ Animate (step by step)" }).clicked() {
                 if !state.animating {
                     state.engine.reset();
                     state.eval.current_step = 0;
@@ -259,6 +272,27 @@ impl App {
             ui.label(format!("Classes: {}", state.engine.n_output));
             ui.label(format!("Delta norm: {:.1}", state.engine.delta_norm()));
             ui.label("Zero backward passes");
+
+            // Bound analysis results
+            if let Some(ref b) = state.bounds {
+                ui.separator();
+                ui.heading("Bound Analysis");
+                ui.label(format!("Neurons: {} ({} dead)", b.model_dim, b.n_dead));
+                ui.label(format!("Diversity: {:.3}", b.neuron_diversity));
+                ui.colored_label(
+                    egui::Color32::from_rgb(245, 166, 35),
+                    format!("Synapse util: {:.1}%", b.synapse_utilization_pct));
+                ui.label(format!("  capacity rank: {}", b.synapse_rank_90));
+                ui.label(format!("  activation rank: {}", b.synapse_activation_rank));
+                ui.label(format!("  condition: {:.0}", b.synapse_condition));
+                ui.colored_label(
+                    egui::Color32::from_rgb(231, 76, 60),
+                    format!("Overthinking: {}/{} ticks", b.n_overthinking, b.n_ticks));
+                ui.label(format!("Best tick: {}", b.best_tick));
+                ui.colored_label(
+                    egui::Color32::from_rgb(91, 138, 245),
+                    format!("Bottleneck: {}", b.bottleneck));
+            }
         });
 
         // ─── Right panel: per-image results ─────────────────────────
@@ -268,6 +302,10 @@ impl App {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let show_n = step.min(n);
+                let thumb_size = 64usize;
+                let thumb_bytes = thumb_size * thumb_size * 3;
+                let has_thumbs = state.eval.thumbnails.len() >= n * thumb_bytes;
+
                 for i in (0..show_n).rev().take(30) {
                     let label = state.eval.labels[i] as usize;
                     let pred = state.eval.hebbian_preds[i] as usize;
@@ -289,15 +327,39 @@ impl App {
                         .map(|s| s.as_str()).unwrap_or("?");
 
                     ui.horizontal(|ui| {
-                        ui.label(format!("#{i:3}"));
-                        ui.colored_label(egui::Color32::GRAY,
-                            format!("base:{base_marker}"));
-                        ui.colored_label(color,
-                            format!("hebb:{hebb_marker}"));
+                        // Thumbnail
+                        if has_thumbs {
+                            let offset = i * thumb_bytes;
+                            let rgb = &state.eval.thumbnails[offset..offset + thumb_bytes];
+                            let pixels: Vec<egui::Color32> = rgb.chunks_exact(3)
+                                .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
+                                .collect();
+                            let tex = ui.ctx().load_texture(
+                                format!("thumb_{i}"),
+                                egui::ColorImage {
+                                    size: [thumb_size, thumb_size],
+                                    pixels,
+                                },
+                                egui::TextureOptions::LINEAR,
+                            );
+                            ui.image(egui::load::SizedTexture::new(
+                                tex.id(), egui::Vec2::new(32.0, 32.0)));
+                        }
+
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("#{i:3}"));
+                                ui.colored_label(egui::Color32::GRAY,
+                                    format!("base:{base_marker}"));
+                                ui.colored_label(color,
+                                    format!("hebb:{hebb_marker}"));
+                            });
+                            ui.label(egui::RichText::new(
+                                format!("{} → {}", label_name, pred_name))
+                                .small().color(egui::Color32::from_gray(160)));
+                        });
                     });
-                    ui.label(egui::RichText::new(
-                        format!("  {} → {}", label_name, pred_name))
-                        .small().color(egui::Color32::from_gray(160)));
+                    ui.separator();
                 }
             });
         });
@@ -502,11 +564,12 @@ fn main() {
         let w_buf = std::fs::read(format!("{base}/output_weights.bin")).expect("output_weights.bin");
         let bl_buf = std::fs::read(format!("{base}/baseline_sync.bin")).expect("baseline_sync.bin");
         let pca_buf = std::fs::read(format!("{base}/sync_pca.bin")).expect("sync_pca.bin");
+        let thumb_buf = std::fs::read(format!("{base}/thumbnails.bin")).unwrap_or_default();
         let meta_json = std::fs::read_to_string(format!("{base}/metadata.json")).expect("metadata.json");
 
         let state = HebbianState::from_buffers(
             &sync_buf, &lf_buf, &lt_buf, &lab_buf,
-            &w_buf, &bl_buf, &pca_buf, &meta_json,
+            &w_buf, &bl_buf, &pca_buf, &thumb_buf, &meta_json,
         );
         println!("Hebbian mode: {} images, {} sync dims", state.eval.n_images, state.engine.n_synch);
         AppMode::Hebbian(state)
@@ -618,11 +681,12 @@ pub async fn wasm_main() {
     let w_buf = fetch_bytes(&format!("{base}/output_weights.bin")).await;
     let bl_buf = fetch_bytes(&format!("{base}/baseline_sync.bin")).await;
     let pca_buf = fetch_bytes(&format!("{base}/sync_pca.bin")).await;
+    let thumb_buf = fetch_bytes(&format!("{base}/thumbnails.bin")).await;
     let meta_json = fetch_text(&format!("{base}/metadata.json")).await;
 
     let state = HebbianState::from_buffers(
         &sync_buf, &lf_buf, &lt_buf, &lab_buf,
-        &w_buf, &bl_buf, &pca_buf, &meta_json,
+        &w_buf, &bl_buf, &pca_buf, &thumb_buf, &meta_json,
     );
 
     let app = App {
