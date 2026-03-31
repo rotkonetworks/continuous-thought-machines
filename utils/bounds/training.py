@@ -194,7 +194,7 @@ class HebbianPlasticity:
         novelty = sync_signal - self.baseline
         gate = (novelty.abs() > novelty.abs().median()).float()
         gated = novelty * gate
-        action_signal = output_weights.T @ gated
+        action_signal = output_weights @ gated
         new_delta = self.lr * torch.outer(gated, action_signal)
         self.delta = self.momentum * self.delta + (1 - self.momentum) * new_delta
 
