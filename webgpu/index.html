@@ -3,26 +3,65 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CTM Hebbian Adaptation</title>
+    <title>CTM Hebbian Adaptation — Interactive Demo</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
     <style>
         html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0a0a0a; }
         canvas { width: 100% !important; height: 100% !important; }
-        #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
-                   color: #5bf58a; font: 24px monospace; }
+        #loading {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #5bf58a; font: 18px monospace;
+            text-align: center; z-index: 100;
+        }
+        #loading .progress { color: #888; font-size: 14px; margin-top: 8px; }
     </style>
 </head>
 <body>
-    <div id="loading">Loading CTM Hebbian Demo (~41MB)...</div>
+    <div id="loading">
+        CTM Hebbian Adaptation Demo
+        <div class="progress" id="status">Initializing...</div>
+    </div>
     <canvas id="ctm-canvas"></canvas>
+
     <script type="module">
+        const status = document.getElementById('status');
+
+        // 1. Load ONNX model (for live inference on user images)
+        status.textContent = 'Loading ONNX model (1.3MB)...';
+        let onnxSession = null;
+        try {
+            onnxSession = await ort.InferenceSession.create('assets/hebbian/ctm_small.onnx', {
+                executionProviders: ['wasm'],
+            });
+            status.textContent = 'ONNX model loaded. Loading WASM...';
+        } catch (e) {
+            console.warn('ONNX load failed (optional):', e);
+            status.textContent = 'Loading WASM (ONNX unavailable)...';
+        }
+
+        // 2. Expose ONNX inference to Rust via global function
+        window.onnxInfer = async function(inputFloat32Array) {
+            if (!onnxSession) return null;
+            const tensor = new ort.Tensor('float32', inputFloat32Array, [1, 1, 64]);
+            const results = await onnxSession.run({ input: tensor });
+            return {
+                predictions: results.predictions.data,
+                certainties: results.certainties.data,
+                sync: results.sync.data,
+            };
+        };
+
+        // 3. Load Rust/WASM Hebbian engine
         import init from './pkg/ctm_debugger.js';
-        async function run() {
+        try {
+            status.textContent = 'Loading Hebbian engine + data (~41MB)...';
             await init();
             document.getElementById('loading').style.display = 'none';
+        } catch (e) {
+            status.textContent = 'Error: ' + e.message;
+            console.error(e);
         }
-        run().catch(e => {
-            document.getElementById('loading').textContent = 'Error: ' + e;
-        });
     </script>
 </body>
 </html>
