@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTM Hebbian Adaptation</title>
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0a0a0a; }
+        canvas { width: 100% !important; height: 100% !important; }
+        #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+                   color: #5bf58a; font: 24px monospace; }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading CTM Hebbian Demo (~41MB)...</div>
+    <canvas id="ctm-canvas"></canvas>
+    <script type="module">
+        import init from './pkg/ctm_debugger.js';
+        async function run() {
+            await init();
+            document.getElementById('loading').style.display = 'none';
+        }
+        run().catch(e => {
+            document.getElementById('loading').textContent = 'Error: ' + e;
+        });
+    </script>
+</body>
+</html>
