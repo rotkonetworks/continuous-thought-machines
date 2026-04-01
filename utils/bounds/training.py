@@ -133,37 +133,39 @@ class HebbianPlasticity:
     rank-4 utilization. The bottleneck is the readout, not the thinking.
     So we adapt the readout via Hebbian updates, not the recurrent dynamics.
 
-    Mechanism:
-    1. After training, snapshot baseline sync pattern
-    2. During inference, sync accumulates across inputs
-    3. Novelty = current_sync - baseline (what's new about this context)
-    4. Project novelty through output weights → action-space meaning
-    5. Outer product: novelty × action_signal → weight delta
-    6. Apply delta additively to output
-
-    This is Hebbian learning: "neurons that fire together, wire together."
-    The sync signal IS co-firing. Novelty IS what's new. The output weights
-    already know what each sync channel means. No backprop needed.
-
-    Poker experiment results:
-        LoRA adapter:           0.001 plasticity
-        Backprop through sync:  0.046 (training explodes)
-        Hebbian sync:           0.193 (193× better, zero gradients)
+    Pluggable strategies (inspired by MADNet's continual adaptation):
+    - Gate: median (default), percentile, topk, or none
+    - Confidence weighting: scale update by model certainty
+    - Reward/punishment histogram: MAD-style module selection
+    - Extrapolation check: verify update actually helped
 
     Usage:
-        hebb = HebbianPlasticity(n_synch=64, n_output=10)
+        hebb = HebbianPlasticity(n_synch=64, n_output=10,
+                                 gate='median',
+                                 confidence_weighted=True,
+                                 use_extrapolation_check=True)
 
-        # After training:
         hebb.snapshot_baseline(model_sync_output)
-
-        # During inference (no gradients):
-        hebb.update(current_sync, output_proj.weight)
+        hebb.update(sync, output_weights, reward=True, confidence=0.9)
         correction = hebb.apply(sync_batch)
         output = base_output + correction
     """
 
     def __init__(self, n_synch: int, n_output: int,
-                 lr: float = 0.05, momentum: float = 0.95):
+                 lr: float = 0.05, momentum: float = 0.95,
+                 # Pluggable gate strategy
+                 gate: str = 'median',  # 'median', 'percentile', 'topk', 'none'
+                 gate_percentile: float = 50.0,
+                 gate_topk: int = 0,  # 0 = auto (n_synch // 4)
+                 # Confidence weighting (from MADNet proxy filtering)
+                 confidence_weighted: bool = False,
+                 # Extrapolation check (MADNet Algorithm 2, line 13-14)
+                 use_extrapolation_check: bool = False,
+                 extrapolation_decay: float = 0.99,
+                 extrapolation_scale: float = 0.01,
+                 # Reward/punishment histogram (MADNet Algorithm 2, line 15-16)
+                 n_modules: int = 0,  # 0 = no modular selection
+                 ):
         self.n_synch = n_synch
         self.n_output = n_output
         self.lr = lr
@@ -171,6 +173,29 @@ class HebbianPlasticity:
         self.baseline = torch.zeros(n_synch)
         self.delta = torch.zeros(n_synch, n_output)
         self.active = False
+
+        # Gate config
+        self.gate_mode = gate
+        self.gate_percentile = gate_percentile
+        self.gate_topk = gate_topk if gate_topk > 0 else max(1, n_synch // 4)
+
+        # Confidence weighting
+        self.confidence_weighted = confidence_weighted
+
+        # Extrapolation check (γ from MADNet)
+        self.use_extrapolation_check = use_extrapolation_check
+        self.extrap_decay = extrapolation_decay
+        self.extrap_scale = extrapolation_scale
+        self._loss_history = []  # last 3 losses for linear extrapolation
+        self._extrap_scale_current = 1.0  # dynamic scaling from extrapolation
+
+        # Modular reward/punishment histogram
+        self.n_modules = n_modules
+        if n_modules > 0:
+            self.histogram = torch.zeros(n_modules)
+            self._last_module = 0
+        else:
+            self.histogram = None
 
     def snapshot_baseline(self, sync_signal: torch.Tensor):
         """Set baseline sync pattern. Call once after training."""
@@ -180,22 +205,114 @@ class HebbianPlasticity:
     def reset(self):
         """Reset accumulated delta for new context."""
         self.delta.zero_()
+        self._loss_history.clear()
+        self._extrap_scale_current = 1.0
+        if self.histogram is not None:
+            self.histogram.zero_()
+
+    def _compute_gate(self, novelty: torch.Tensor) -> torch.Tensor:
+        """Compute gating mask based on selected strategy."""
+        abs_nov = novelty.abs()
+        if self.gate_mode == 'none':
+            return torch.ones_like(novelty)
+        elif self.gate_mode == 'median':
+            return (abs_nov > abs_nov.median()).float()
+        elif self.gate_mode == 'percentile':
+            if len(novelty) < 2:
+                return torch.ones_like(novelty)
+            sorted_vals = abs_nov.sort().values
+            idx = int(self.gate_percentile / 100.0 * (len(sorted_vals) - 1))
+            threshold = sorted_vals[idx]
+            return (abs_nov > threshold).float()
+        elif self.gate_mode == 'topk':
+            k = min(self.gate_topk, len(novelty))
+            _, top_indices = abs_nov.topk(k)
+            mask = torch.zeros_like(novelty)
+            mask[top_indices] = 1.0
+            return mask
+        else:
+            return (abs_nov > abs_nov.median()).float()
+
+    def report_loss(self, loss: float):
+        """Report current loss for extrapolation check.
+
+        Call after each prediction, before update. The extrapolation
+        check compares actual loss against linearly extrapolated expected
+        loss to determine if the previous update helped.
+
+        From MADNet Algorithm 2 lines 13-14:
+            L_tilde = 2 * L_{t-1} - L_{t-2}
+            gamma = L_tilde - L_t
+        """
+        self._loss_history.append(loss)
+        if len(self._loss_history) >= 3:
+            l_t = self._loss_history[-1]
+            l_t1 = self._loss_history[-2]
+            l_t2 = self._loss_history[-3]
+            expected = 2 * l_t1 - l_t2
+            gamma = expected - l_t  # positive = update helped
+            self._extrap_scale_current = (
+                self.extrap_decay * self._extrap_scale_current
+                + self.extrap_scale * gamma
+            )
+            # Keep only last 3
+            self._loss_history = self._loss_history[-3:]
+
+    def select_module(self) -> int:
+        """MAD-style module selection from reward histogram.
+
+        Returns module index to update. Call before update().
+        """
+        if self.histogram is None:
+            return 0
+        probs = torch.softmax(self.histogram, dim=0)
+        selected = torch.multinomial(probs, 1).item()
+        self._last_module = selected
+        return selected
+
+    def reward_module(self, gamma: float):
+        """Reward/punish the last selected module.
+
+        From MADNet Algorithm 2 lines 15-16:
+            H = δ · H
+            H[φ_{t-1}] += λ · γ
+        """
+        if self.histogram is None:
+            return
+        self.histogram *= self.extrap_decay
+        self.histogram[self._last_module] += self.extrap_scale * gamma
 
     @torch.no_grad()
-    def update(self, sync_signal: torch.Tensor, output_weights: torch.Tensor):
+    def update(self, sync_signal: torch.Tensor, output_weights: torch.Tensor,
+               reward: bool = True, confidence: float = 1.0):
         """Hebbian update from sync novelty.
 
         Args:
             sync_signal: [n_synch] current sync readout (mean over batch)
             output_weights: [n_output, n_synch] the output projection weight matrix
+            reward: if False, skip update (positive reinforcement only)
+            confidence: model certainty score [0, 1] — scales the update
         """
-        if not self.active:
+        if not self.active or not reward:
             return
+
         novelty = sync_signal - self.baseline
-        gate = (novelty.abs() > novelty.abs().median()).float()
+        gate = self._compute_gate(novelty)
         gated = novelty * gate
+
         action_signal = output_weights @ gated
         new_delta = self.lr * torch.outer(gated, action_signal)
+
+        # Confidence weighting: scale update by model certainty
+        if self.confidence_weighted:
+            new_delta = new_delta * confidence
+
+        # Extrapolation check: scale by whether updates are helping
+        if self.use_extrapolation_check:
+            # Clamp to [0.1, 2.0] to prevent runaway scaling
+            scale = max(0.1, min(2.0, self._extrap_scale_current))
+            new_delta = new_delta * scale
+
         self.delta = self.momentum * self.delta + (1 - self.momentum) * new_delta
 
     def apply(self, sync: torch.Tensor) -> torch.Tensor:
