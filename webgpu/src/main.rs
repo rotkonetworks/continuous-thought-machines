@@ -9,6 +9,7 @@
 
 mod data;
 mod hebbian;
+mod qec;
 mod render;
 
 use data::SnapshotBuffer;
