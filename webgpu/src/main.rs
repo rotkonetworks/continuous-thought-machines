@@ -9,6 +9,7 @@
 
 mod data;
 mod gpu_render;
+mod gpu_scene;
 mod hebbian;
 mod qec;
 mod render;
@@ -157,6 +158,42 @@ impl eframe::App for App {
         let is_loading = matches!(self.mode, AppMode::Loading);
         let is_debugger = matches!(self.mode, AppMode::Debugger(_));
         let is_qec = matches!(self.mode, AppMode::QEC(_));
+        let is_hebbian = matches!(self.mode, AppMode::Hebbian(_));
+
+        // Mode switcher bar (always visible except when loading)
+        if !is_loading {
+            egui::TopBottomPanel::top("mode_selector").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("CTM BOUNDS EXPLORER")
+                        .strong().size(14.0)
+                        .color(egui::Color32::from_rgb(200, 200, 200)));
+                    ui.separator();
+
+                    if ui.selectable_label(is_hebbian, "🖼 ImageNet").clicked() && !is_hebbian {
+                        // Can only switch to Hebbian if data was loaded
+                        // (WASM always loads it, native needs --hebbian flag)
+                    }
+                    if ui.selectable_label(is_qec, "⚛ QEC Decoder").clicked() && !is_qec {
+                        self.mode = AppMode::QEC(QECState {
+                            code: qec::SurfaceCode::new(5),
+                            current_result: None,
+                            noise_rate: 0.05,
+                            num_rounds: 5,
+                            prediction: None,
+                            current_tick: 0,
+                            max_ticks: 16,
+                            animating: false,
+                            total: 0,
+                            correct: 0,
+                            mwpm_correct: 0,
+                        });
+                    }
+                    if ui.selectable_label(is_debugger, "📊 Tick Debugger").clicked() && !is_debugger {
+                        // Would need tick data loaded
+                    }
+                });
+            });
+        }
 
         if is_loading {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -347,23 +384,19 @@ impl App {
                         .map(|s| s.as_str()).unwrap_or("?");
 
                     ui.horizontal(|ui| {
-                        // Thumbnail
+                        // Thumbnail — colored square placeholder
+                        // (real textures cause wgpu destroy-in-use errors when recreated per frame)
                         if has_thumbs {
                             let offset = i * thumb_bytes;
-                            let rgb = &state.eval.thumbnails[offset..offset + thumb_bytes];
-                            let pixels: Vec<egui::Color32> = rgb.chunks_exact(3)
-                                .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
-                                .collect();
-                            let tex = ui.ctx().load_texture(
-                                format!("thumb_{i}"),
-                                egui::ColorImage {
-                                    size: [thumb_size, thumb_size],
-                                    pixels,
-                                },
-                                egui::TextureOptions::LINEAR,
-                            );
-                            ui.image(egui::load::SizedTexture::new(
-                                tex.id(), egui::Vec2::new(32.0, 32.0)));
+                            // Sample center pixel for average color
+                            let center = offset + (32 * thumb_size + 32) * 3;
+                            let rgb = &state.eval.thumbnails;
+                            if center + 2 < rgb.len() {
+                                let color = egui::Color32::from_rgb(rgb[center], rgb[center+1], rgb[center+2]);
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::Vec2::splat(32.0), egui::Sense::hover());
+                                ui.painter().rect_filled(r, 3.0, color);
+                            }
                         }
 
                         ui.vertical(|ui| {
