@@ -117,6 +117,12 @@ canvas { width: 100%; height: 100%; display: block; }
                 <button id="btn-new">New Syndrome</button>
                 <button id="btn-run100">Run 100</button>
             </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-left:8px;">
+                <span style="color:#fbbf24;font-size:10px;">correction α</span>
+                <input type="range" id="alpha-slider" min="0" max="50" value="0"
+                    style="width:80px;accent-color:#fbbf24;">
+                <span id="alpha-val" style="color:#fbbf24;font-size:11px;font-family:monospace;min-width:32px;">0.00</span>
+            </div>
         </div>
         <div class="header-right">
             <span>tick <span class="v" id="s-tick">—</span>/15</span>
@@ -139,7 +145,7 @@ canvas { width: 100%; height: 100%; display: block; }
         </div>
         <div class="item">
             <div class="dot" style="background:#fbbf24;"></div>
-            <span>Gap = distance from SDP-optimal bound (Angeris 2022)</span>
+            <span>Gap = correction potential (distance to homeostatic optimal)</span>
         </div>
         <div class="item">
             <div class="dot" style="background:#c084fc;"></div>
@@ -221,7 +227,7 @@ let stats = {total:0, correct:0}, playing = false, playTimer = null;
 
 async function init() {
     try {
-        session = await ort.InferenceSession.create('assets/hebbian/qec_decoder.onnx',
+        session = await ort.InferenceSession.create('assets/hebbian/qec_decoder_v2.onnx',
             {executionProviders:['wasm']});
         document.getElementById('status').textContent = 'ready';
         document.getElementById('status').style.color = '#4ade80';
@@ -250,6 +256,14 @@ function buildUI() {
         el.textContent = '·';
         rib.appendChild(el);
     }
+
+    window._correctionAlpha = 0;
+    const alphaSlider = document.getElementById('alpha-slider');
+    const alphaValEl = document.getElementById('alpha-val');
+    alphaSlider.oninput = () => {
+        window._correctionAlpha = alphaSlider.value / 100;
+        alphaValEl.textContent = window._correctionAlpha.toFixed(2);
+    };
 
     document.getElementById('btn-new').onclick = newSyndrome;
     document.getElementById('btn-run100').onclick = run100;
@@ -285,17 +299,19 @@ function generateSyndrome() {
 
 async function runInference(syn) {
     if (!session) return null;
-    const out = await session.run({syndrome: new ort.Tensor('float32', syn, [1,120])});
+    const alphaVal = window._correctionAlpha || 0; const out = await session.run({syndrome: new ort.Tensor('float32', syn, [1,120]), alpha: new ort.Tensor('float32', new Float32Array([alphaVal]), [1])});
     const raw = out.predictions.data;
+    const gapsRaw = out.gaps ? Array.from(out.gaps.data) : null;
     const preds = [];
     for(let c=0;c<4;c++) { const row=[]; for(let t=0;t<16;t++) row.push(raw[c*16+t]); preds.push(row); }
-    return preds;
+    return {preds, gaps: gapsRaw};
 }
 
 async function newSyndrome() {
     const s = generateSyndrome();
-    const preds = await runInference(s.syndrome);
-    if (!preds) return;
+    const result = await runInference(s.syndrome);
+    if (!result) return;
+    const {preds, gaps} = result;
     const ticks = [];
     for (let t=0;t<16;t++) {
         const logits = preds.map(r=>r[t]);
@@ -305,8 +321,11 @@ async function newSyndrome() {
         const probs = exps.map(e=>e/sum);
         const pred = logits.indexOf(maxL);
         const loss = -Math.log(probs[s.label]+1e-8);
+        // Use REAL gap from model (SDP-based) if available, else entropy proxy
+        const realGap = gaps ? gaps[t] : null;
         const entropy = -probs.reduce((a,p)=>a+p*Math.log(p+1e-8),0);
-        ticks.push({pred, probs, loss, gap:entropy/Math.log(4), correct:pred===s.label});
+        const gap = realGap !== null ? realGap : entropy/Math.log(4);
+        ticks.push({pred, probs, loss, gap, realGap: realGap!==null, correct:pred===s.label});
     }
     tickData = {ticks, label:s.label, synBits:s.synBits, xErr:s.xErr, zErr:s.zErr};
     stats.total++; if(ticks[15].correct) stats.correct++;
@@ -322,9 +341,9 @@ async function run100() {
     el.textContent = 'running...'; el.style.color = '#fbbf24';
     for (let i=0;i<100;i++) {
         const s = generateSyndrome();
-        const preds = await runInference(s.syndrome);
-        if (!preds) break;
-        const logits = preds.map(r=>r[15]);
+        const result = await runInference(s.syndrome);
+        if (!result) break;
+        const logits = result.preds.map(r=>r[15]);
         stats.total++; if(logits.indexOf(Math.max(...logits))===s.label) stats.correct++;
     }
     document.getElementById('s-acc').textContent = `${(stats.correct/stats.total*100).toFixed(1)}%`;
