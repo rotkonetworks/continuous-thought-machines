@@ -115,7 +115,7 @@ canvas { width: 100%; height: 100%; display: block; }
             </div>
             <div style="display:flex;align-items:center;gap:8px;margin-left:8px;">
                 <span style="color:#fbbf24;font-size:10px;">correction α</span>
-                <input type="range" id="alpha-slider" min="0" max="50" value="0"
+                <input type="range" id="alpha-slider" min="0" max="50" value="0" title="Experimental — may not improve accuracy"
                     style="width:80px;accent-color:#fbbf24;">
                 <span id="alpha-val" style="color:#fbbf24;font-size:11px;font-family:monospace;min-width:32px;">0.00</span>
             </div>
@@ -166,11 +166,11 @@ canvas { width: 100%; height: 100%; display: block; }
             The Cholesky solver runs inside the ONNX graph — no external computation.</p>
 
             <p style="margin-top:12px;"><span style="color:#22d3ee;">Hebbian plasticity</span> —
-            CTM sync signal (pairwise neuron products) supports
-            <a href="https://en.wikipedia.org/wiki/Hebbian_theory#Relationship_to_unsupervised_learning,_stability,_and_generalization" style="color:#60a5fa;">Hebbian adaptation</a>.
-            Demonstrated on poker (+2.5pp, zero gradients). The forward correction is the principled formulation —
-            SDP provides the target that Hebbian approximates. Open problem: regulation mechanism for
-            consistent improvement across tasks.</p>
+            CTM sync signal (pairwise neuron products) is a natural substrate for
+            <a href="https://en.wikipedia.org/wiki/Hebbian_theory#Relationship_to_unsupervised_learning,_stability,_and_generalization" style="color:#60a5fa;">Hebbian learning</a>.
+            The forward correction is a principled formulation where the SDP bound provides
+            the optimization target. Open problem: finding a regulation mechanism where
+            correction consistently improves accuracy. The α slider lets you explore this.</p>
 
             <p style="margin-top:12px;"><span style="color:#ccc;">Controls:</span>
             New Syndrome → generate + infer. Arrow keys or ▶ to step ticks.
@@ -309,23 +309,48 @@ function buildUI() {
 }
 
 function generateSyndrome() {
-    const d=5,n=25,p=0.05;
-    const xErr=new Uint8Array(n), zErr=new Uint8Array(n);
-    for(let q=0;q<n;q++) if(Math.random()<p) {
-        const t=Math.floor(Math.random()*3);
-        if(t===0||t===1) xErr[q]=1;
-        if(t===2||t===1) zErr[q]=1;
-    }
-    const syn=new Float32Array(120);
+    // Full 5-round syndrome — replicates Python surface_code.py exactly
+    const d=5, n=25, p=0.05, R=5, nStab=24, nX=12;
+
+    // Parity checks — same construction as SurfaceCode.__init__
+    const hx=[], hz=[];
     for(let r=0;r<d-1;r++) for(let c=0;c<d-1;c++) {
-        const qs=[r*d+c,r*d+c+1,(r+1)*d+c,(r+1)*d+c+1];
-        let xp=0,zp=0; qs.forEach(q=>{xp^=zErr[q];zp^=xErr[q];});
-        if((r+c)%2===0) syn[96+r*(d-1)+c]=xp; else syn[96+r*(d-1)+c]=zp;
+        const f=[r*d+c, r*d+c+1, (r+1)*d+c, (r+1)*d+c+1];
+        if((r+c)%2===0) hx.push(f); else hz.push(f);
     }
+    for(let c=0;c<d-1;c+=2) hz.push([c, c+1]);
+    for(let c=1;c<d-1;c+=2) hz.push([(d-1)*d+c, (d-1)*d+c+1]);
+    for(let r=0;r<d-1;r+=2) hx.push([r*d, (r+1)*d]);
+    for(let r=1;r<d-1;r+=2) hx.push([r*d+d-1, (r+1)*d+d-1]);
+    while(hx.length>nX) hx.pop();
+    while(hz.length>nX) hz.pop();
+
+    const logX=[],logZ=[];
+    for(let c=0;c<d;c++) logX.push(c);
+    for(let r=0;r<d;r++) logZ.push(r*d);
+
+    const totX=new Uint8Array(n), totZ=new Uint8Array(n);
+    const syn=new Float32Array(R*nStab);
+    let lastXErr=new Uint8Array(n), lastZErr=new Uint8Array(n);
+
+    for(let round=0;round<R;round++) {
+        for(let q=0;q<n;q++) if(Math.random()<p) {
+            const t=Math.floor(Math.random()*3);
+            if(t===0||t===1){totX[q]^=1;lastXErr[q]=1;}
+            if(t===2||t===1){totZ[q]^=1;lastZErr[q]=1;}
+        }
+        const off=round*nStab;
+        for(let si=0;si<hx.length;si++){let par=0;hx[si].forEach(q=>{par^=totZ[q];});syn[off+si]=par;}
+        for(let si=0;si<hz.length;si++){let par=0;hz[si].forEach(q=>{par^=totX[q];});syn[off+nX+si]=par;}
+        for(let si=0;si<nStab;si++) if(Math.random()<p) syn[off+si]=1-syn[off+si];
+    }
+
     let xLog=0,zLog=0;
-    for(let c=0;c<d;c++) zLog^=zErr[c];
-    for(let r=0;r<d;r++) xLog^=xErr[r*d];
-    return {syndrome:syn, label:xLog+2*zLog, xErr, zErr, synBits:Array.from(syn.slice(96,120))};
+    logZ.forEach(q=>{xLog^=totX[q];});
+    logX.forEach(q=>{zLog^=totZ[q];});
+
+    return {syndrome:syn, label:xLog+2*zLog, xErr:lastXErr, zErr:lastZErr,
+            synBits:Array.from(syn.slice((R-1)*nStab, R*nStab))};
 }
 
 async function runInference(syn) {
