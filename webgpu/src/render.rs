@@ -614,3 +614,291 @@ pub fn render_hebbian(
             Color32::from_rgb(46, 204, 113));
     }
 }
+
+/// Render bound analysis overlay on the Hebbian view.
+/// Shows synapse utilization gauge, overthinking indicator, and bottleneck.
+pub fn render_bounds_overlay(
+    painter: &Painter,
+    rect: Rect,
+    bounds: &crate::data::BoundsInfo,
+) {
+    let x = rect.min.x + 10.0;
+    let mut y = rect.max.y - 160.0;
+    let bar_w = 120.0;
+    let bar_h = 10.0;
+
+    // Title
+    painter.text(
+        Pos2::new(x, y),
+        egui::Align2::LEFT_TOP, "BOUND ANALYSIS",
+        egui::FontId::monospace(10.0),
+        Color32::from_rgb(245, 166, 35),
+    );
+    y += 16.0;
+
+    // Synapse utilization gauge
+    let util = bounds.synapse_utilization_pct as f32 / 100.0;
+    painter.text(
+        Pos2::new(x, y),
+        egui::Align2::LEFT_TOP,
+        format!("Synapse: {:.1}%", bounds.synapse_utilization_pct),
+        egui::FontId::monospace(9.0),
+        Color32::from_gray(180),
+    );
+    y += 14.0;
+
+    // Bar background
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(x, y), egui::Vec2::new(bar_w, bar_h)),
+        2.0, Color32::from_gray(40),
+    );
+    // Bar fill — red if low utilization, green if high
+    let util_color = if util < 0.1 {
+        Color32::from_rgb(231, 76, 60)   // red — bad
+    } else if util < 0.5 {
+        Color32::from_rgb(245, 166, 35)  // orange — ok
+    } else {
+        Color32::from_rgb(46, 204, 113)  // green — good
+    };
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(x, y), egui::Vec2::new(bar_w * util.min(1.0), bar_h)),
+        2.0, util_color,
+    );
+    painter.text(
+        Pos2::new(x + bar_w + 5.0, y - 1.0),
+        egui::Align2::LEFT_TOP,
+        format!("rank {}/{}", bounds.synapse_activation_rank, bounds.synapse_rank_90),
+        egui::FontId::monospace(8.0),
+        Color32::from_gray(120),
+    );
+    y += 18.0;
+
+    // Overthinking gauge
+    let overthink_frac = bounds.n_overthinking as f32 / bounds.n_ticks.max(1) as f32;
+    painter.text(
+        Pos2::new(x, y),
+        egui::Align2::LEFT_TOP,
+        format!("Overthinking: {}/{} ticks", bounds.n_overthinking, bounds.n_ticks),
+        egui::FontId::monospace(9.0),
+        Color32::from_gray(180),
+    );
+    y += 14.0;
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(x, y), egui::Vec2::new(bar_w, bar_h)),
+        2.0, Color32::from_gray(40),
+    );
+    let ot_color = if overthink_frac > 0.5 {
+        Color32::from_rgb(231, 76, 60)
+    } else if overthink_frac > 0.2 {
+        Color32::from_rgb(245, 166, 35)
+    } else {
+        Color32::from_rgb(46, 204, 113)
+    };
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(x, y), egui::Vec2::new(bar_w * overthink_frac, bar_h)),
+        2.0, ot_color,
+    );
+    painter.text(
+        Pos2::new(x + bar_w + 5.0, y - 1.0),
+        egui::Align2::LEFT_TOP,
+        format!("best tick: {}", bounds.best_tick),
+        egui::FontId::monospace(8.0),
+        Color32::from_gray(120),
+    );
+    y += 18.0;
+
+    // Condition number
+    let cond_color = if bounds.synapse_condition > 500.0 {
+        Color32::from_rgb(231, 76, 60)
+    } else {
+        Color32::from_gray(150)
+    };
+    painter.text(
+        Pos2::new(x, y),
+        egui::Align2::LEFT_TOP,
+        format!("Condition: {:.0}", bounds.synapse_condition),
+        egui::FontId::monospace(9.0),
+        cond_color,
+    );
+    y += 16.0;
+
+    // Bottleneck
+    painter.text(
+        Pos2::new(x, y),
+        egui::Align2::LEFT_TOP,
+        &bounds.bottleneck,
+        egui::FontId::monospace(9.0),
+        Color32::from_rgb(91, 138, 245),
+    );
+}
+
+// ============================================================
+// QEC surface code visualization
+// ============================================================
+
+/// Render a surface code lattice with errors, syndromes, and decoder output.
+pub fn render_qec(
+    painter: &Painter,
+    rect: Rect,
+    code: &crate::qec::SurfaceCode,
+    result: &crate::qec::SyndromeResult,
+    prediction: Option<u8>,
+    tick: usize,
+    n_ticks: usize,
+) {
+    let d = code.d;
+    let margin = 60.0;
+    let area = Rect::from_min_max(
+        Pos2::new(rect.min.x + margin, rect.min.y + margin + 30.0),
+        Pos2::new(rect.min.x + margin + 400.0, rect.min.y + margin + 430.0),
+    );
+
+    let cell_w = area.width() / d as f32;
+    let cell_h = area.height() / d as f32;
+
+    // Title
+    let label_names = ["I (no error)", "X logical", "Z logical", "Y logical"];
+    let true_label = result.label as usize;
+    painter.text(
+        Pos2::new(area.center().x, rect.min.y + 15.0),
+        egui::Align2::CENTER_TOP,
+        format!("Surface Code d={d}  |  True: {}  |  Tick: {tick}/{n_ticks}",
+                label_names[true_label.min(3)]),
+        egui::FontId::monospace(13.0),
+        Color32::WHITE,
+    );
+
+    // Draw data qubits
+    for q in 0..code.n_data {
+        let (cx, cy) = code.qubit_pos(q);
+        let x = area.min.x + (cx + 0.5) * cell_w;
+        let y = area.min.y + (cy + 0.5) * cell_h;
+
+        let has_x_err = result.x_errors[q];
+        let has_z_err = result.z_errors[q];
+
+        let color = match (has_x_err, has_z_err) {
+            (false, false) => Color32::from_rgb(60, 60, 80),    // no error — dark
+            (true, false) => Color32::from_rgb(255, 80, 80),     // X error — red
+            (false, true) => Color32::from_rgb(80, 80, 255),     // Z error — blue
+            (true, true) => Color32::from_rgb(200, 80, 200),     // Y error — purple
+        };
+
+        let radius = cell_w.min(cell_h) * 0.3;
+        painter.circle_filled(Pos2::new(x, y), radius, color);
+
+        // Qubit label
+        painter.text(
+            Pos2::new(x, y),
+            egui::Align2::CENTER_CENTER,
+            format!("{q}"),
+            egui::FontId::monospace(8.0),
+            Color32::from_gray(200),
+        );
+    }
+
+    // Draw stabilizer syndromes
+    for si in 0..code.n_stab {
+        let (cx, cy) = code.stab_pos(si);
+        let x = area.min.x + (cx + 0.5) * cell_w;
+        let y = area.min.y + (cy + 0.5) * cell_h;
+
+        let fired = result.syndrome[si];
+        let is_x_stab = si < code.n_x_stab;
+
+        if fired {
+            let color = if is_x_stab {
+                Color32::from_rgb(255, 200, 50)  // X-stabilizer fired — yellow
+            } else {
+                Color32::from_rgb(50, 255, 200)  // Z-stabilizer fired — cyan
+            };
+            let size = cell_w.min(cell_h) * 0.15;
+            painter.rect_filled(
+                Rect::from_center_size(Pos2::new(x, y), egui::Vec2::splat(size * 2.0)),
+                2.0, color,
+            );
+        }
+    }
+
+    // Prediction display
+    let pred_x = area.max.x + 40.0;
+    let pred_y = area.min.y;
+
+    if let Some(pred) = prediction {
+        let pred_label = pred as usize;
+        let correct = pred_label == true_label;
+        let color = if correct {
+            Color32::from_rgb(46, 204, 113)
+        } else {
+            Color32::from_rgb(231, 76, 60)
+        };
+
+        painter.text(
+            Pos2::new(pred_x, pred_y),
+            egui::Align2::LEFT_TOP,
+            format!("Prediction: {}", label_names[pred_label.min(3)]),
+            egui::FontId::monospace(14.0),
+            color,
+        );
+
+        painter.text(
+            Pos2::new(pred_x, pred_y + 20.0),
+            egui::Align2::LEFT_TOP,
+            if correct { "✓ CORRECT" } else { "✗ WRONG" },
+            egui::FontId::monospace(16.0),
+            color,
+        );
+    }
+
+    // Thinking progress bar
+    if n_ticks > 0 {
+        let bar_y = area.max.y + 20.0;
+        let bar_w = area.width();
+        let bar_h = 12.0;
+        let progress = tick as f32 / n_ticks as f32;
+
+        // Background
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(area.min.x, bar_y),
+                egui::Vec2::new(bar_w, bar_h)),
+            3.0, Color32::from_gray(40),
+        );
+        // Fill
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(area.min.x, bar_y),
+                egui::Vec2::new(bar_w * progress, bar_h)),
+            3.0, Color32::from_rgb(91, 138, 245),
+        );
+        painter.text(
+            Pos2::new(area.min.x + bar_w + 10.0, bar_y),
+            egui::Align2::LEFT_TOP,
+            format!("Thinking... {tick}/{n_ticks}"),
+            egui::FontId::monospace(10.0),
+            Color32::from_gray(150),
+        );
+    }
+
+    // Legend
+    let leg_x = pred_x;
+    let leg_y = pred_y + 60.0;
+    let legends = [
+        (Color32::from_rgb(60, 60, 80), "No error"),
+        (Color32::from_rgb(255, 80, 80), "X error"),
+        (Color32::from_rgb(80, 80, 255), "Z error"),
+        (Color32::from_rgb(200, 80, 200), "Y error"),
+        (Color32::from_rgb(255, 200, 50), "X-stab fired"),
+        (Color32::from_rgb(50, 255, 200), "Z-stab fired"),
+    ];
+    for (i, (color, label)) in legends.iter().enumerate() {
+        let y = leg_y + i as f32 * 18.0;
+        painter.circle_filled(Pos2::new(leg_x, y + 6.0), 5.0, *color);
+        painter.text(
+            Pos2::new(leg_x + 12.0, y),
+            egui::Align2::LEFT_TOP, *label,
+            egui::FontId::monospace(10.0),
+            Color32::from_gray(180),
+        );
+    }
+}

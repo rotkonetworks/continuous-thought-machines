@@ -31,7 +31,23 @@ use std::path::PathBuf;
 enum AppMode {
     Debugger(DebuggerState),
     Hebbian(HebbianState),
+    QEC(QECState),
     Loading, // WASM: waiting for data to load
+}
+
+struct QECState {
+    code: qec::SurfaceCode,
+    current_result: Option<qec::SyndromeResult>,
+    noise_rate: f32,
+    num_rounds: usize,
+    prediction: Option<u8>,
+    current_tick: usize,
+    max_ticks: usize,
+    animating: bool,
+    // Stats
+    total: usize,
+    correct: usize,
+    mwpm_correct: usize,
 }
 
 struct DebuggerState {
@@ -137,9 +153,9 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(50));
 
-        // Determine which mode we're in without holding a borrow
         let is_loading = matches!(self.mode, AppMode::Loading);
         let is_debugger = matches!(self.mode, AppMode::Debugger(_));
+        let is_qec = matches!(self.mode, AppMode::QEC(_));
 
         if is_loading {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -150,6 +166,8 @@ impl eframe::App for App {
             });
         } else if is_debugger {
             self.update_debugger(ctx);
+        } else if is_qec {
+            self.update_qec(ctx);
         } else {
             self.update_hebbian(ctx);
         }
@@ -390,6 +408,151 @@ impl App {
                     &painter, response.rect, &state.eval, &self.camera,
                     state.show_base, step,
                 );
+
+                // Render bounds overlay on top
+                if let Some(ref bounds) = state.bounds {
+                    render::render_bounds_overlay(&painter, response.rect, bounds);
+                }
+            });
+    }
+
+    // ─── Debugger mode UI (existing, unchanged) ─────────────────────
+
+    // ─── QEC mode UI ─────────────────────────────────────────────
+
+    fn update_qec(&mut self, ctx: &egui::Context) {
+        let state = match &mut self.mode {
+            AppMode::QEC(s) => s,
+            _ => return,
+        };
+
+        // Animate thinking
+        if state.animating {
+            if let Some(ref result) = state.current_result {
+                if state.current_tick < state.max_ticks {
+                    state.current_tick += 1;
+                    // At final tick, make a "prediction" (random for now — real decoder needs ONNX)
+                    if state.current_tick >= state.max_ticks {
+                        // Simple heuristic decoder: majority vote from syndrome weight
+                        let n_x = state.code.n_x_stab;
+                        let x_weight: usize = result.syndrome[..n_x].iter().filter(|&&s| s).count();
+                        let z_weight: usize = result.syndrome[n_x..].iter().filter(|&&s| s).count();
+                        let pred = if x_weight == 0 && z_weight == 0 {
+                            0 // no error
+                        } else if z_weight > x_weight {
+                            1 // X error (detected by Z stabs)
+                        } else if x_weight > z_weight {
+                            2 // Z error (detected by X stabs)
+                        } else {
+                            3 // Y
+                        };
+                        state.prediction = Some(pred);
+                        let correct = pred == result.label;
+                        state.total += 1;
+                        if correct { state.correct += 1; }
+                        state.animating = false;
+                    }
+                }
+            }
+        }
+
+        // Top panel
+        egui::TopBottomPanel::top("qec_top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("CTM QEC DECODER")
+                    .strong().size(16.0)
+                    .color(egui::Color32::from_rgb(91, 138, 245)));
+                ui.separator();
+                ui.label(format!("d={}", state.code.d));
+                ui.separator();
+                if state.total > 0 {
+                    let acc = state.correct as f32 / state.total as f32;
+                    ui.label(format!("Accuracy: {:.1}% ({}/{})",
+                        acc * 100.0, state.correct, state.total));
+                }
+            });
+        });
+
+        // Left panel: controls
+        egui::SidePanel::left("qec_controls").min_width(180.0).show(ctx, |ui| {
+            ui.heading("Controls");
+            ui.separator();
+
+            ui.label("Noise rate (p):");
+            ui.add(egui::Slider::new(&mut state.noise_rate, 0.01..=0.15)
+                .text("p"));
+
+            ui.label("QEC rounds:");
+            ui.add(egui::Slider::new(&mut state.num_rounds, 1..=10)
+                .text("R"));
+
+            ui.separator();
+
+            if ui.button("▶ New Syndrome").clicked() {
+                let result = state.code.generate_syndrome(state.noise_rate);
+                state.current_result = Some(result);
+                state.prediction = None;
+                state.current_tick = 0;
+                state.animating = true;
+            }
+
+            if ui.button("⏩ Run 100").clicked() {
+                for _ in 0..100 {
+                    let result = state.code.generate_syndrome(state.noise_rate);
+                    let n_x = state.code.n_x_stab;
+                    let x_w: usize = result.syndrome[..n_x].iter().filter(|&&s| s).count();
+                    let z_w: usize = result.syndrome[n_x..].iter().filter(|&&s| s).count();
+                    let pred = if x_w == 0 && z_w == 0 { 0 }
+                        else if z_w > x_w { 1 }
+                        else if x_w > z_w { 2 }
+                        else { 3 };
+                    state.total += 1;
+                    if pred == result.label { state.correct += 1; }
+                    state.current_result = Some(result);
+                    state.prediction = Some(pred);
+                }
+                state.current_tick = state.max_ticks;
+                state.animating = false;
+            }
+
+            if ui.button("Reset stats").clicked() {
+                state.total = 0;
+                state.correct = 0;
+            }
+
+            ui.separator();
+            ui.heading("Info");
+            ui.label(format!("Data qubits: {}", state.code.n_data));
+            ui.label(format!("Stabilizers: {}", state.code.n_stab));
+            ui.label(format!("Ticks: {}", state.max_ticks));
+            ui.label("MWPM baseline: ~39%");
+            ui.label("CTM target: ~48%");
+        });
+
+        // Central panel: lattice visualization
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_gray(15)))
+            .show(ctx, |ui| {
+                let (response, painter) = ui.allocate_painter(
+                    ui.available_size(), egui::Sense::click_and_drag(),
+                );
+
+                if let Some(ref result) = state.current_result {
+                    render::render_qec(
+                        &painter, response.rect,
+                        &state.code, result,
+                        state.prediction,
+                        state.current_tick, state.max_ticks,
+                    );
+                } else {
+                    painter.text(
+                        response.rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Click 'New Syndrome' to start",
+                        egui::FontId::monospace(16.0),
+                        egui::Color32::from_gray(100),
+                    );
+                }
             });
     }
 
@@ -554,8 +717,29 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let hebbian_mode = args.iter().any(|a| a == "--hebbian");
+    let qec_mode = args.iter().any(|a| a == "--qec");
 
-    let mode = if hebbian_mode {
+    let mode = if qec_mode {
+        let d: usize = args.iter()
+            .position(|a| a == "--distance")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        println!("QEC mode: d={d}");
+        AppMode::QEC(QECState {
+            code: qec::SurfaceCode::new(d),
+            current_result: None,
+            noise_rate: 0.05,
+            num_rounds: 5,
+            prediction: None,
+            current_tick: 0,
+            max_ticks: 16,
+            animating: false,
+            total: 0,
+            correct: 0,
+            mwpm_correct: 0,
+        })
+    } else if hebbian_mode {
         // Load binary assets from assets/hebbian/
         let base = "webgpu/assets/hebbian";
         let sync_buf = std::fs::read(format!("{base}/sync_signals.bin")).expect("sync_signals.bin");
