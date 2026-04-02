@@ -21,9 +21,6 @@ html, body { width: 100%; height: 100%; background: #08080c; color: #b0b0b8;
 .header h1 { font-size: 15px; font-weight: 700; letter-spacing: 0.5px;
              background: linear-gradient(135deg, #4ade80, #22d3ee); -webkit-background-clip: text;
              -webkit-text-fill-color: transparent; }
-.header .tag { font-size: 9px; padding: 2px 8px; border-radius: 10px;
-               background: rgba(74,222,128,0.1); color: #4ade80; border: 1px solid rgba(74,222,128,0.15);
-               text-transform: uppercase; letter-spacing: 1px; }
 .header-right { display: flex; align-items: center; gap: 12px; }
 .header-right span { color: #555; font-size: 11px; font-family: 'SF Mono', monospace; }
 .header-right .v { color: #4ade80; }
@@ -112,7 +109,6 @@ canvas { width: 100%; height: 100%; display: block; }
     <div class="header">
         <div class="header-left">
             <h1>CTM Inference Debugger</h1>
-            <span class="tag">Real ONNX</span>
             <div class="actions">
                 <button id="btn-new">New Syndrome</button>
                 <button id="btn-run100">Run 100</button>
@@ -140,88 +136,50 @@ canvas { width: 100%; height: 100%; display: block; }
     <!-- Info bar -->
     <div class="info-bar">
         <div class="item"><div class="dot" style="background:#4ade80;"></div>
-            <span>Real 278K-param CTM + Cholesky correction running in ONNX</span></div>
+            <span>d=5 surface code</span></div>
         <div class="item"><div class="dot" style="background:#60a5fa;"></div>
-            <span>Base CTM (α=0) vs Corrected (α=slider) — same syndrome, both real</span></div>
+            <span>16 ticks</span></div>
         <div class="item"><div class="dot" style="background:#fbbf24;"></div>
-            <span>Per-tick least-squares optimal nudge via SDP bound framework</span></div>
+            <span>Cholesky correction α=<span id="info-alpha">0</span></span></div>
         <div class="item">
-            <a href="https://github.com/rotkonetworks/continuous-thought-machines/tree/bounds-analysis" target="_blank">github</a></div>
+            <a href="https://github.com/rotkonetworks/continuous-thought-machines/tree/bounds-analysis" target="_blank">src</a></div>
     </div>
 
     <!-- Info Modal -->
     <div id="info-modal" style="display:none; position:fixed; inset:0; z-index:100;
-         background:rgba(0,0,0,0.85); overflow-y:auto;">
-        <div style="max-width:640px; margin:40px auto; padding:32px; background:#0d0d15;
-             border:1px solid rgba(255,255,255,0.06); border-radius:8px; line-height:1.7;">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
-                <h2 style="font-size:16px;color:#4ade80;">What This Demonstrates</h2>
+         background:rgba(0,0,0,0.85); overflow-y:auto;" onclick="if(event.target===this)this.style.display='none'">
+        <div style="max-width:580px; margin:40px auto; padding:28px; background:#0d0d15;
+             border:1px solid rgba(255,255,255,0.06); border-radius:6px; line-height:1.7; font-size:12px; color:#777;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <span style="font-size:14px;color:#ccc;">About</span>
                 <button onclick="document.getElementById('info-modal').style.display='none'"
-                    style="background:none;border:1px solid #333;color:#888;padding:4px 12px;cursor:pointer;border-radius:3px;">Close</button>
+                    style="background:none;border:1px solid #222;color:#555;padding:3px 10px;cursor:pointer;border-radius:3px;font-size:11px;">esc</button>
             </div>
 
-            <h3 style="color:#60a5fa;font-size:13px;margin:16px 0 8px;">Continuous Thought Machine (CTM)</h3>
-            <p style="color:#888;font-size:12px;">
-                A CTM processes input through multiple <strong style="color:#ccc;">thinking ticks</strong> — internal
-                recurrence steps where each tick refines the prediction. Unlike feedforward networks that produce
-                one answer, a CTM <em>thinks</em> and can change its mind. This debugger lets you step through
-                each tick and watch predictions evolve.
-            </p>
+            <p>Time-travel debugger for <a href="https://arxiv.org/abs/2505.05522" style="color:#60a5fa;">Continuous Thought Machines</a>.
+            Step through 16 thinking ticks on a d=5 surface code QEC decoder (278K params, ONNX inference in browser).</p>
 
-            <h3 style="color:#fbbf24;font-size:13px;margin:16px 0 8px;">SDP-Guided Forward Correction (Our Innovation)</h3>
-            <p style="color:#888;font-size:12px;">
-                At each thinking tick, we compute the <strong style="color:#ccc;">optimal NLM weights</strong> via
-                least-squares on the trace history (solved by Cholesky decomposition inside the ONNX model).
-                The <strong style="color:#fbbf24;">α slider</strong> controls how much we nudge activations toward
-                this optimum. This is inspired by the SDP dual framework of
-                <a href="https://arxiv.org/abs/2208.04411" style="color:#4ade80;" target="_blank">Angeris (2022)</a>
-                applied to CTM recurrence.
-            </p>
-            <p style="color:#888;font-size:12px;">
-                <strong style="color:#ccc;">Key result:</strong> Forward correction improves QEC decoder accuracy
-                with zero backward passes — the correction runs during inference, not training.
-            </p>
+            <p style="margin-top:12px;"><span style="color:#fbbf24;">Forward correction</span> —
+            At each tick, compute optimal NLM weights via Cholesky least-squares on trace history.
+            Nudge activations toward optimal by α. Based on
+            <a href="https://arxiv.org/abs/2208.04411" style="color:#60a5fa;">Angeris (2022)</a> SDP bound framework.
+            The Cholesky solver runs inside the ONNX graph — no external computation.</p>
 
-            <h3 style="color:#c084fc;font-size:13px;margin:16px 0 8px;">Quantum Error Correction (QEC)</h3>
-            <p style="color:#888;font-size:12px;">
-                The task: decode a distance-5 surface code syndrome to identify the logical error class
-                (I=none, X, Z, or Y). Standard MWPM decoder achieves ~39%. Our CTM decoder achieves ~48%.
-                The surface code lattice shows data qubits (circles) with errors highlighted, and
-                stabilizer measurements (squares) indicating where errors were detected.
-            </p>
+            <p style="margin-top:12px;"><span style="color:#22d3ee;">Hebbian plasticity</span> —
+            CTM sync signal (pairwise neuron products) supports
+            <a href="https://doi.org/10.1038/s41467-025-67137-1" style="color:#60a5fa;">Hebbian adaptation</a>.
+            Proven on poker (+2.5pp, zero gradients). The forward correction is the principled formulation —
+            SDP provides the target that Hebbian approximates. Open problem: regulation mechanism for
+            consistent improvement across tasks.</p>
 
-            <h3 style="color:#22d3ee;font-size:13px;margin:16px 0 8px;">Hebbian Plasticity</h3>
-            <p style="color:#888;font-size:12px;">
-                The CTM's <strong style="color:#ccc;">sync signal</strong> (pairwise neuron products) is a
-                natural substrate for <a href="https://doi.org/10.1038/s41467-025-67137-1" style="color:#4ade80;" target="_blank">Hebbian learning</a>
-                — "neurons that fire together wire together." We proved this works on poker (+2.5pp
-                across all hyperparameter settings, zero backward passes).
-            </p>
-            <p style="color:#888;font-size:12px;">
-                <strong style="color:#ccc;">Current status:</strong> The architecture supports Hebbian
-                adaptation via sync novelty, but we have not yet found a regulation mechanism that
-                consistently improves results across tasks. The forward correction (above) is the
-                principled version — the SDP bound provides the target that naive Hebbian approximates.
-                The open problem: connecting Hebbian's online adaptivity with the SDP's optimality
-                guarantee. See <a href="https://doi.org/10.1038/s41467-025-67137-1" style="color:#4ade80;" target="_blank">Cazalets & Dambre (2026)</a>
-                for homeostatic structural plasticity approaches.
-            </p>
+            <p style="margin-top:12px;"><span style="color:#ccc;">Controls:</span>
+            New Syndrome → generate + infer. Arrow keys or ▶ to step ticks.
+            α slider for correction strength. Run 100 compares base (α=0) vs corrected.</p>
 
-            <h3 style="color:#f87171;font-size:13px;margin:16px 0 8px;">How to Use</h3>
-            <ul style="color:#888;font-size:12px;padding-left:20px;">
-                <li><strong style="color:#ccc;">New Syndrome</strong> — generate random error pattern + run real ONNX inference</li>
-                <li><strong style="color:#ccc;">Arrow keys / Play</strong> — step through 16 thinking ticks</li>
-                <li><strong style="color:#ccc;">α slider</strong> — set to 0 for base CTM, increase for forward correction</li>
-                <li><strong style="color:#ccc;">Run 100</strong> — batch inference to measure accuracy</li>
-                <li><strong style="color:#ccc;">Compare</strong> — base accuracy (α=0) vs corrected shown in header</li>
-            </ul>
-
-            <div style="margin-top:20px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.04);
-                 font-size:10px;color:#444;">
-                CTM: <a href="https://arxiv.org/abs/2505.05522" style="color:#4ade80;" target="_blank">Sakana AI (2025)</a> ·
-                SDP Bounds: <a href="https://arxiv.org/abs/2208.04411" style="color:#4ade80;" target="_blank">Angeris (2022)</a> ·
-                Code: <a href="https://github.com/rotkonetworks/continuous-thought-machines/tree/bounds-analysis" style="color:#4ade80;" target="_blank">github</a>
-            </div>
+            <p style="margin-top:16px;font-size:10px;color:#444;">
+            <a href="https://arxiv.org/abs/2505.05522" style="color:#555;">CTM</a> ·
+            <a href="https://arxiv.org/abs/2208.04411" style="color:#555;">Angeris</a> ·
+            <a href="https://github.com/rotkonetworks/continuous-thought-machines/tree/bounds-analysis" style="color:#555;">code</a></p>
         </div>
     </div>
 
@@ -265,15 +223,6 @@ canvas { width: 100%; height: 100%; display: block; }
                     background:rgba(255,255,255,0.02);"></canvas>
             </section>
 
-            <section>
-                <h2>About</h2>
-                <div style="font-size:10px; color:#444; line-height:1.6;">
-                    SDP bound analysis (Angeris 2022) applied to Continuous Thought Machines.
-                    Each tick is one thinking step. The gap measures how far the model's
-                    activations are from the SDP-optimal. Forward correction nudges activations
-                    toward optimal at each tick — closing the gap without backpropagation.
-                </div>
-            </section>
         </div>
     </div>
 
@@ -333,6 +282,8 @@ function buildUI() {
     alphaSlider.oninput = () => {
         window._correctionAlpha = alphaSlider.value / 100;
         alphaValEl.textContent = window._correctionAlpha.toFixed(2);
+        const ia = document.getElementById('info-alpha');
+        if (ia) ia.textContent = window._correctionAlpha.toFixed(2);
     };
 
     document.getElementById('btn-new').onclick = newSyndrome;
