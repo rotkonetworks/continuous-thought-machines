@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTM Aurora — Continuous Thought Visualized</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+#alpha-control {
+    position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 12px;
+    font: 13px monospace; color: rgba(255,255,255,0.5);
+    z-index: 10;
+}
+#alpha-control input[type=range] {
+    width: 200px; accent-color: #4ade80;
+}
+#alpha-control .val { color: #4ade80; min-width: 40px; }
+#info {
+    position: fixed; top: 20px; left: 20px;
+    font: 11px monospace; color: rgba(255,255,255,0.3);
+    line-height: 1.6; z-index: 10;
+}
+#info .highlight { color: rgba(74, 222, 128, 0.7); }
+#info .dim { color: rgba(255,255,255,0.15); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info">
+    <span class="dim">CTM FORWARD CORRECTION</span><br>
+    <span class="dim">tick:</span> <span id="tick-display" class="highlight">0</span>
+    <span class="dim">/ 16</span><br>
+    <span class="dim">gap:</span> <span id="gap-display" class="highlight">—</span><br>
+    <span class="dim">neurons:</span> <span id="neuron-display" class="highlight">256</span>
+</div>
+<div id="alpha-control">
+    <span>correction α</span>
+    <input type="range" id="alpha" min="0" max="100" value="0">
+    <span class="val" id="alpha-val">0.00</span>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const alphaSlider = document.getElementById('alpha');
+const alphaVal = document.getElementById('alpha-val');
+const tickDisplay = document.getElementById('tick-display');
+const gapDisplay = document.getElementById('gap-display');
+
+let W, H;
+function resize() {
+    W = canvas.width = window.innerWidth * devicePixelRatio;
+    H = canvas.height = window.innerHeight * devicePixelRatio;
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── Neuron simulation ──────────────────────────────────────
+const N_NEURONS = 256;
+const N_TICKS = 16;
+const N_SYNCH = 64;
+
+// Neuron positions — arranged by PCA-like clustering
+const neurons = [];
+for (let i = 0; i < N_NEURONS; i++) {
+    // Arrange in a flowing pattern, not a grid
+    const angle = (i / N_NEURONS) * Math.PI * 6 + Math.random() * 0.5;
+    const radius = 0.15 + (i / N_NEURONS) * 0.25 + Math.random() * 0.05;
+    neurons.push({
+        x: 0.5 + Math.cos(angle) * radius,
+        y: 0.5 + Math.sin(angle) * radius * 0.6,
+        activation: 0,
+        optimal: 0,
+        contribution: Math.random(), // will be set by "bound analysis"
+        phase: Math.random() * Math.PI * 2,
+    });
+}
+
+// Simulate per-tick activations (approximating real CTM behavior)
+// Early ticks: low activation, scattered. Late ticks: focused, stronger.
+const tickActivations = [];
+const tickOptimal = [];
+const tickGaps = [];
+
+for (let t = 0; t < N_TICKS; t++) {
+    const acts = new Float32Array(N_NEURONS);
+    const opts = new Float32Array(N_NEURONS);
+    const progress = t / (N_TICKS - 1);
+
+    for (let n = 0; n < N_NEURONS; n++) {
+        // Activation builds up over ticks, concentrated in fewer neurons
+        const isImportant = neurons[n].contribution > 0.7;
+        const base = Math.sin(neurons[n].phase + t * 0.4) * 0.3;
+        const growth = progress * (isImportant ? 0.8 : 0.2);
+        acts[n] = Math.max(0, base + growth + Math.random() * 0.1);
+
+        // Optimal: what SDP says the activation SHOULD be
+        // More focused, less noisy, stronger on important neurons
+        opts[n] = isImportant ? progress * 0.9 : progress * 0.1;
+    }
+    tickActivations.push(acts);
+    tickOptimal.push(opts);
+
+    // Gap: RMS distance between achieved and optimal
+    let gapSq = 0, actSq = 0;
+    for (let n = 0; n < N_NEURONS; n++) {
+        const diff = acts[n] - opts[n];
+        gapSq += diff * diff;
+        actSq += acts[n] * acts[n];
+    }
+    tickGaps.push(actSq > 0 ? Math.sqrt(gapSq / actSq) : 0);
+}
+
+// Sync connections: top correlated neuron pairs
+const connections = [];
+for (let i = 0; i < N_SYNCH; i++) {
+    const a = Math.floor(Math.random() * N_NEURONS);
+    let b = Math.floor(Math.random() * N_NEURONS);
+    while (b === a) b = Math.floor(Math.random() * N_NEURONS);
+    connections.push({ a, b, strength: Math.random() });
+}
+
+// ─── Animation state ────────────────────────────────────────
+let time = 0;
+let currentTick = 0;
+let alpha = 0;
+let tickTimer = 0;
+const TICK_DURATION = 120; // frames per tick cycle
+
+alphaSlider.addEventListener('input', () => {
+    alpha = alphaSlider.value / 100 * 0.5; // 0 to 0.5
+    alphaVal.textContent = alpha.toFixed(2);
+});
+
+// ─── Render ─────────────────────────────────────────────────
+function render() {
+    time++;
+    tickTimer++;
+
+    // Advance tick
+    if (tickTimer > TICK_DURATION / N_TICKS) {
+        tickTimer = 0;
+        currentTick = (currentTick + 1) % N_TICKS;
+        tickDisplay.textContent = currentTick;
+    }
+
+    const t = currentTick;
+    const acts = tickActivations[t];
+    const opts = tickOptimal[t];
+
+    // Compute corrected activations
+    const corrected = new Float32Array(N_NEURONS);
+    let gapSq = 0, actSq = 0;
+    for (let n = 0; n < N_NEURONS; n++) {
+        corrected[n] = acts[n] + alpha * (opts[n] - acts[n]);
+        const diff = corrected[n] - opts[n];
+        gapSq += diff * diff;
+        actSq += corrected[n] * corrected[n];
+    }
+    const gap = actSq > 0 ? Math.sqrt(gapSq / actSq) : 0;
+    gapDisplay.textContent = gap.toFixed(3);
+
+    // Clear with slight trail
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+    ctx.fillRect(0, 0, W, H);
+
+    // Tick position indicator (subtle line at bottom)
+    const tickX = (t / (N_TICKS - 1)) * W * 0.8 + W * 0.1;
+    ctx.beginPath();
+    ctx.moveTo(tickX, H - 20);
+    ctx.lineTo(tickX, H - 5);
+    ctx.strokeStyle = 'rgba(74, 222, 128, 0.3)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // Tick markers
+    for (let i = 0; i < N_TICKS; i++) {
+        const x = (i / (N_TICKS - 1)) * W * 0.8 + W * 0.1;
+        ctx.beginPath();
+        ctx.arc(x, H - 12, i === t ? 3 : 1, 0, Math.PI * 2);
+        ctx.fillStyle = i === t ? 'rgba(74, 222, 128, 0.8)' : 'rgba(255,255,255,0.15)';
+        ctx.fill();
+    }
+
+    // Draw sync connections (brief arcs of light between co-firing neurons)
+    for (const conn of connections) {
+        const actA = corrected[conn.a];
+        const actB = corrected[conn.b];
+        const cofire = actA * actB * conn.strength;
+
+        if (cofire > 0.05) {
+            const nA = neurons[conn.a];
+            const nB = neurons[conn.b];
+            const x1 = nA.x * W, y1 = nA.y * H;
+            const x2 = nB.x * W, y2 = nB.y * H;
+
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            const intensity = Math.min(cofire * 2, 1);
+            ctx.strokeStyle = `rgba(74, 180, 255, ${intensity * 0.15})`;
+            ctx.lineWidth = intensity * 2;
+            ctx.stroke();
+        }
+    }
+
+    // Draw neurons
+    for (let n = 0; n < N_NEURONS; n++) {
+        const neuron = neurons[n];
+        const act = corrected[n];
+        const opt = opts[n];
+        const x = neuron.x * W;
+        const y = neuron.y * H;
+
+        // Optimal ghost (faint, where activation should be)
+        if (alpha > 0 && opt > 0.05) {
+            ctx.beginPath();
+            ctx.arc(x, y, opt * 15 + 2, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(74, 222, 128, ${opt * 0.08})`;
+            ctx.fill();
+        }
+
+        // Actual activation
+        if (act > 0.01) {
+            const size = act * 12 + 1;
+
+            // Color: green if close to optimal, orange if far
+            const dist = Math.abs(act - opt) / Math.max(opt, 0.01);
+            const r = Math.min(255, 100 + dist * 200);
+            const g = Math.max(100, 222 - dist * 150);
+            const b = Math.min(200, 128 + (1 - dist) * 100);
+            const a = Math.min(0.9, act * 1.5);
+
+            // Glow
+            ctx.beginPath();
+            ctx.arc(x, y, size * 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a * 0.1})`;
+            ctx.fill();
+
+            // Core
+            ctx.beginPath();
+            ctx.arc(x, y, size, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${a})`;
+            ctx.fill();
+        }
+    }
+
+    requestAnimationFrame(render);
+}
+
+render();
+</script>
+</body>
+</html>
