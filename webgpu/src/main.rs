@@ -47,6 +47,7 @@ struct QECState {
     current_tick: usize,
     max_ticks: usize,
     animating: bool,
+    onnx_available: bool,
     // Stats
     total: usize,
     correct: usize,
@@ -616,7 +617,8 @@ impl App {
                 state.animating = true;
             }
 
-            if ui.button("⏩ Run 1000").clicked() {
+            // Run with MWPM (parity decoder — runs in Rust, always available)
+            if ui.button("⏩ Run 1000 (MWPM)").clicked() {
                 for _ in 0..1000 {
                     let result = state.code.generate_syndrome(state.noise_rate);
                     let n_x = state.code.n_x_stab;
@@ -624,24 +626,93 @@ impl App {
                     let z_f: usize = result.syndrome[n_x..].iter().filter(|&&s| s).count();
                     let total_f = x_f + z_f;
 
-                    // MWPM parity decoder
-                    let mwpm_pred = if total_f == 0 { 0 } else {
+                    let mwpm_pred: u8 = if total_f == 0 { 0 } else {
                         let xe = z_f % 2 == 1;
                         let ze = x_f % 2 == 1;
                         match (xe, ze) { (false,false)=>0, (true,false)=>1, (false,true)=>2, _=>3 }
                     };
 
-                    // CTM uses same parity decoder here (real CTM needs ONNX)
-                    let ctm_pred = mwpm_pred;
-
                     state.total += 1;
-                    if ctm_pred == result.label { state.correct += 1; }
                     if mwpm_pred == result.label { state.mwpm_correct += 1; }
+                    // CTM not available without ONNX — don't fake it
                     state.current_result = Some(result);
-                    state.prediction = Some(ctm_pred);
+                    state.prediction = Some(mwpm_pred);
                 }
                 state.current_tick = state.max_ticks;
                 state.animating = false;
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Run with real CTM via ONNX (calls JS, async)
+                if ui.button("⏩ Run 100 (Real CTM)").clicked() {
+                    // Generate syndromes, flatten, call JS
+                    let mut all_syndromes: Vec<f32> = Vec::new();
+                    let mut all_labels: Vec<u8> = Vec::new();
+                    let mut all_mwpm: Vec<u8> = Vec::new();
+
+                    for _ in 0..100 {
+                        let (syns, label) = state.code.generate_rounds(state.noise_rate, 5);
+                        let flat = qec::SurfaceCode::syndromes_to_vec(&syns);
+                        all_syndromes.extend_from_slice(&flat);
+                        all_labels.push(label);
+
+                        // MWPM for comparison
+                        let last_syn = &syns[syns.len() - 1];
+                        let n_x = state.code.n_x_stab;
+                        let x_f = last_syn[..n_x].iter().filter(|&&s| s).count();
+                        let z_f = last_syn[n_x..].iter().filter(|&&s| s).count();
+                        let mwpm: u8 = if x_f + z_f == 0 { 0 } else {
+                            match (z_f % 2 == 1, x_f % 2 == 1) {
+                                (false,false) => 0, (true,false) => 1,
+                                (false,true) => 2, _ => 3,
+                            }
+                        };
+                        all_mwpm.push(mwpm);
+                    }
+
+                    // Call JS ONNX inference
+                    let syndromes_js = js_sys::Float32Array::from(all_syndromes.as_slice());
+                    let promise = js_sys::eval(&format!(
+                        "window.qecInferBatch(new Float32Array({}), {})",
+                        "arguments[0]", 100
+                    ));
+
+                    // For now, use spawn_local to handle the async call
+                    use std::sync::{Arc, Mutex};
+                    let labels = all_labels.clone();
+                    let mwpm_preds = all_mwpm.clone();
+
+                    // Fire-and-forget async inference
+                    let window = web_sys::window().unwrap();
+                    let syndromes_array = js_sys::Float32Array::from(all_syndromes.as_slice());
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let func = js_sys::Reflect::get(
+                            &window, &wasm_bindgen::JsValue::from_str("qecInferBatch")
+                        ).unwrap();
+                        let func: js_sys::Function = func.dyn_into().unwrap();
+                        let promise = func.call2(
+                            &wasm_bindgen::JsValue::NULL,
+                            &syndromes_array,
+                            &wasm_bindgen::JsValue::from(100),
+                        ).unwrap();
+                        let promise: js_sys::Promise = promise.dyn_into().unwrap();
+                        let result = wasm_bindgen_futures::JsFuture::from(promise).await;
+                        if let Ok(val) = result {
+                            let arr: js_sys::Array = val.dyn_into().unwrap();
+                            let mut ctm_correct = 0u32;
+                            let mut mwpm_correct = 0u32;
+                            for i in 0..100 {
+                                let ctm_pred = arr.get(i as u32).as_f64().unwrap_or(0.0) as u8;
+                                if ctm_pred == labels[i] { ctm_correct += 1; }
+                                if mwpm_preds[i] == labels[i] { mwpm_correct += 1; }
+                            }
+                            log::info!("Real CTM: {}/100, MWPM: {}/100",
+                                ctm_correct, mwpm_correct);
+                        }
+                    });
+                }
             }
 
             if ui.button("Reset stats").clicked() {

@@ -55,14 +55,40 @@
         status.textContent = 'Models loaded. Loading WASM...';
 
         // 2. Expose REAL inference to Rust
+        // QEC inference — runs real ONNX model
+        // Returns: {prediction: int, predictions_all_ticks: [4*16]}
         window.qecInfer = async function(syndromeFloat32Array) {
             if (!qecSession) return null;
             const tensor = new ort.Tensor('float32', syndromeFloat32Array, [1, 120]);
             const results = await qecSession.run({ syndrome: tensor });
-            return {
-                predictions: Array.from(results.predictions.data),  // [4, 16]
-                sync: Array.from(results.sync.data),                // [64]
-            };
+            // predictions shape: [1, 4, 16] — pick argmax of last tick
+            const preds = results.predictions.data; // Float32Array length 64 (1*4*16)
+            // Last tick = indices 60-63 (tick 15, 4 classes)
+            let maxVal = -Infinity, maxIdx = 0;
+            for (let c = 0; c < 4; c++) {
+                const val = preds[c * 16 + 15]; // class c, tick 15
+                if (val > maxVal) { maxVal = val; maxIdx = c; }
+            }
+            return maxIdx;
+        };
+
+        // Batch QEC inference for Run N button
+        window.qecInferBatch = async function(syndromesFlat, batchSize) {
+            if (!qecSession) return null;
+            const results = [];
+            for (let i = 0; i < batchSize; i++) {
+                const syn = syndromesFlat.slice(i * 120, (i + 1) * 120);
+                const tensor = new ort.Tensor('float32', syn, [1, 120]);
+                const out = await qecSession.run({ syndrome: tensor });
+                const preds = out.predictions.data;
+                let maxVal = -Infinity, maxIdx = 0;
+                for (let c = 0; c < 4; c++) {
+                    const val = preds[c * 16 + 15];
+                    if (val > maxVal) { maxVal = val; maxIdx = c; }
+                }
+                results.push(maxIdx);
+            }
+            return results;
         };
 
         window.imagenetInfer = async function(inputFloat32Array) {

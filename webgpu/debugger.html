@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTM Inference Debugger</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; background: #0a0a0f; color: #ccc;
+             font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; overflow: hidden; }
+.container { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; }
+.top { padding: 12px 20px; display: flex; align-items: center; gap: 16px;
+       border-bottom: 1px solid #1a1a2e; background: #0d0d15; flex-wrap: wrap; }
+.top h1 { font-size: 13px; color: #4ade80; font-weight: 600; letter-spacing: 1px; }
+.top button { background: #1a1a2e; color: #aaa; border: 1px solid #2a2a3e;
+    padding: 5px 14px; font: inherit; cursor: pointer; border-radius: 3px; }
+.top button:hover { border-color: #4ade80; color: #fff; }
+.top .stat { color: #666; }
+.top .val { color: #4ade80; }
+.top .val.wrong { color: #f87171; }
+.main { display: grid; grid-template-columns: 1fr 280px; overflow: hidden; }
+canvas { width: 100%; height: 100%; display: block; }
+.panel { background: #0d0d15; border-left: 1px solid #1a1a2e; padding: 14px;
+         overflow-y: auto; font-size: 11px; }
+.panel h2 { font-size: 10px; color: #555; text-transform: uppercase; letter-spacing: 2px;
+            margin: 12px 0 6px; }
+.panel h2:first-child { margin-top: 0; }
+.pred-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; }
+.pred-cell { text-align: center; padding: 6px 2px; border-radius: 3px; font-size: 12px; }
+.pred-cell.hit { background: #1a3a1a; color: #4ade80; border: 1px solid #4ade80; }
+.pred-cell.miss { background: #3a1a1a; color: #f87171; border: 1px solid #f87171; }
+.pred-cell.true { background: #2a2a1a; color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+.pred-cell.off { background: #111118; color: #444; border: 1px solid #1a1a2e; }
+.gap-bar { height: 6px; background: #1a1a2e; border-radius: 3px; overflow: hidden; margin: 4px 0; }
+.gap-fill { height: 100%; border-radius: 3px; transition: width 0.2s; }
+.timeline { padding: 10px 20px; border-top: 1px solid #1a1a2e; background: #0d0d15;
+            display: flex; align-items: center; gap: 12px; }
+.ticks { flex: 1; display: flex; gap: 2px; }
+.tick { flex: 1; height: 36px; border-radius: 3px; cursor: pointer; display: flex;
+        flex-direction: column; align-items: center; justify-content: center;
+        transition: all 0.1s; font-size: 9px; }
+.tick:hover { background: #1a1a2e; }
+.tick.active { background: #1a1a2e; border-bottom: 2px solid #4ade80; }
+.tick .tp { font-size: 11px; font-weight: bold; }
+.timeline button { background: #1a1a2e; color: #aaa; border: 1px solid #2a2a3e;
+    padding: 6px 14px; font: inherit; cursor: pointer; border-radius: 3px; }
+.timeline button:hover { border-color: #4ade80; color: #fff; }
+#status { color: #666; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="container">
+    <div class="top">
+        <h1>CTM INFERENCE DEBUGGER</h1>
+        <button id="btn-new">New Syndrome</button>
+        <button id="btn-run100">Run 100</button>
+        <span class="stat">tick: <span class="val" id="s-tick">—</span>/15</span>
+        <span class="stat">pred: <span class="val" id="s-pred">—</span></span>
+        <span class="stat">loss: <span class="val" id="s-loss">—</span></span>
+        <span class="stat">gap: <span class="val" id="s-gap">—</span></span>
+        <span class="stat">accuracy: <span class="val" id="s-acc">—</span></span>
+        <span id="status">Loading ONNX model...</span>
+    </div>
+    <div class="main">
+        <canvas id="c"></canvas>
+        <div class="panel">
+            <h2>Prediction</h2>
+            <div class="pred-grid" id="pred-grid"></div>
+            <h2>Gap (achieved vs optimal)</h2>
+            <div class="gap-bar"><div class="gap-fill" id="gap-fill"></div></div>
+            <div id="gap-text" style="color:#666; font-size:10px;"></div>
+            <h2>Per-tick Loss</h2>
+            <canvas id="loss-chart" width="240" height="80" style="width:100%;"></canvas>
+            <h2>Per-tick Prediction</h2>
+            <div id="tick-preds" style="font-size:10px; line-height:1.8;"></div>
+        </div>
+    </div>
+    <div class="timeline">
+        <button id="btn-prev">◀</button>
+        <button id="btn-play">▶</button>
+        <button id="btn-next">▶</button>
+        <div class="ticks" id="ticks"></div>
+    </div>
+</div>
+<script>
+const CLASSES = ['I','X','Z','Y'];
+const COLORS = ['#888','#f87171','#60a5fa','#c084fc'];
+let session = null;
+let currentTick = 0;
+let tickData = null; // {preds: [4][16], label: int, syndrome: [24]}
+let stats = {total: 0, correct: 0};
+let playing = false, playTimer = null;
+
+// ─── ONNX ───────────────────────────────────────────────
+async function init() {
+    try {
+        session = await ort.InferenceSession.create('assets/hebbian/qec_decoder.onnx',
+            {executionProviders: ['wasm']});
+        document.getElementById('status').textContent = 'ONNX ready — real CTM inference';
+        document.getElementById('status').style.color = '#4ade80';
+    } catch(e) {
+        document.getElementById('status').textContent = 'ONNX failed: ' + e.message;
+        document.getElementById('status').style.color = '#f87171';
+    }
+    buildTickBar();
+    document.getElementById('btn-new').onclick = newSyndrome;
+    document.getElementById('btn-run100').onclick = run100;
+    document.getElementById('btn-prev').onclick = () => { if(currentTick>0){currentTick--;render();} };
+    document.getElementById('btn-next').onclick = () => { if(currentTick<15){currentTick++;render();} };
+    document.getElementById('btn-play').onclick = togglePlay;
+    document.addEventListener('keydown', e => {
+        if(e.key==='ArrowLeft'&&currentTick>0){currentTick--;render();}
+        if(e.key==='ArrowRight'&&currentTick<15){currentTick++;render();}
+        if(e.key===' '){e.preventDefault();togglePlay();}
+    });
+}
+
+// Generate random d=5 syndrome (depolarizing p=0.05)
+function generateSyndrome() {
+    const d=5, n=25, p=0.05;
+    const xErr=new Uint8Array(n), zErr=new Uint8Array(n);
+    for(let q=0;q<n;q++){
+        if(Math.random()<p){
+            const t=Math.floor(Math.random()*3);
+            if(t===0||t===1)xErr[q]=1; // X or Y
+            if(t===2||t===1)zErr[q]=1; // Z or Y
+        }
+    }
+    // Simplified syndrome: use parity of errors in 2x2 faces
+    const syn=new Float32Array(120); // 5 rounds × 24 stabs
+    // Just fill last round (simplified — real code would do multi-round)
+    for(let r=0;r<d-1;r++) for(let c=0;c<d-1;c++){
+        const qs=[r*d+c,r*d+c+1,(r+1)*d+c,(r+1)*d+c+1];
+        let xp=0,zp=0;
+        qs.forEach(q=>{xp^=zErr[q];zp^=xErr[q];});
+        if((r+c)%2===0) syn[96+r*(d-1)+c]=xp; // last round X-stabs
+        else syn[96+r*(d-1)+c]=zp;              // last round Z-stabs
+    }
+    // Label
+    let xLog=0,zLog=0;
+    for(let c=0;c<d;c++) zLog^=zErr[c]; // Z on first row
+    for(let r=0;r<d;r++) xLog^=xErr[r*d]; // X on first col
+    const label = xLog + 2*zLog;
+    return {syndrome:syn, label, xErr, zErr, synBits:Array.from(syn.slice(96,120))};
+}
+
+async function runInference(syndrome) {
+    if(!session) return null;
+    const tensor = new ort.Tensor('float32', syndrome, [1, 120]);
+    const out = await session.run({syndrome: tensor});
+    // predictions: [1, 4, 16]
+    const raw = out.predictions.data;
+    const preds = [];
+    for(let c=0;c<4;c++){
+        const row=[];
+        for(let t=0;t<16;t++) row.push(raw[c*16+t]);
+        preds.push(row);
+    }
+    return preds;
+}
+
+async function newSyndrome() {
+    const s = generateSyndrome();
+    const preds = await runInference(s.syndrome);
+    if(!preds) return;
+
+    // Per-tick: compute softmax, argmax, loss proxy
+    const ticks = [];
+    for(let t=0;t<16;t++){
+        const logits = preds.map(row=>row[t]);
+        const maxL = Math.max(...logits);
+        const exps = logits.map(l=>Math.exp(l-maxL));
+        const sum = exps.reduce((a,b)=>a+b);
+        const probs = exps.map(e=>e/sum);
+        const pred = logits.indexOf(maxL);
+        const loss = -Math.log(probs[s.label]+1e-8);
+        // Gap: entropy of prediction (high entropy = uncertain = large gap)
+        const entropy = -probs.reduce((a,p)=>a+p*Math.log(p+1e-8),0);
+        const maxEntropy = Math.log(4);
+        ticks.push({pred, probs, loss, gap: entropy/maxEntropy, correct: pred===s.label});
+    }
+
+    tickData = {ticks, label:s.label, synBits:s.synBits, xErr:s.xErr, zErr:s.zErr};
+    const finalCorrect = ticks[15].correct;
+    stats.total++;
+    if(finalCorrect) stats.correct++;
+
+    currentTick = 15;
+    render();
+}
+
+async function run100() {
+    document.getElementById('status').textContent = 'Running 100 inferences...';
+    for(let i=0;i<100;i++){
+        const s = generateSyndrome();
+        const preds = await runInference(s.syndrome);
+        if(!preds) break;
+        const logits = preds.map(row=>row[15]);
+        const pred = logits.indexOf(Math.max(...logits));
+        stats.total++;
+        if(pred===s.label) stats.correct++;
+    }
+    document.getElementById('s-acc').textContent =
+        `${(stats.correct/stats.total*100).toFixed(1)}% (${stats.correct}/${stats.total})`;
+    document.getElementById('status').textContent = 'Done';
+    document.getElementById('status').style.color = '#4ade80';
+}
+
+function togglePlay() {
+    playing=!playing;
+    document.getElementById('btn-play').textContent=playing?'⏸':'▶';
+    if(playing){currentTick=0;render();
+        playTimer=setInterval(()=>{
+            currentTick++;if(currentTick>=16){currentTick=15;playing=false;
+            document.getElementById('btn-play').textContent='▶';clearInterval(playTimer);}
+            render();
+        },300);
+    } else clearInterval(playTimer);
+}
+
+function buildTickBar(){
+    const bar=document.getElementById('ticks');
+    for(let t=0;t<16;t++){
+        const d=document.createElement('div');
+        d.className='tick';d.dataset.t=t;
+        d.innerHTML=`<span style="color:#555">t${t}</span><span class="tp">—</span>`;
+        d.onclick=()=>{currentTick=t;render();};
+        bar.appendChild(d);
+    }
+}
+
+function render(){
+    if(!tickData)return;
+    const t=currentTick, td=tickData.ticks[t];
+
+    // Top stats
+    document.getElementById('s-tick').textContent=t;
+    const predEl=document.getElementById('s-pred');
+    predEl.textContent=CLASSES[td.pred]+(td.correct?' ✓':' ✗');
+    predEl.className='val'+(td.correct?'':' wrong');
+    document.getElementById('s-loss').textContent=td.loss.toFixed(3);
+    document.getElementById('s-gap').textContent=td.gap.toFixed(3);
+    if(stats.total>0)
+        document.getElementById('s-acc').textContent=
+            `${(stats.correct/stats.total*100).toFixed(1)}% (${stats.correct}/${stats.total})`;
+
+    // Pred grid
+    const pg=document.getElementById('pred-grid');
+    pg.innerHTML='';
+    CLASSES.forEach((cls,i)=>{
+        const prob=td.probs[i];
+        const isPred=i===td.pred, isLabel=i===tickData.label;
+        const c=isPred&&td.correct?'hit':isPred?'miss':isLabel?'true':'off';
+        pg.innerHTML+=`<div class="pred-cell ${c}">${cls}<br>${(prob*100).toFixed(1)}%</div>`;
+    });
+
+    // Gap bar
+    const gf=document.getElementById('gap-fill');
+    gf.style.width=(td.gap*100)+'%';
+    gf.style.background=td.gap>0.7?'#f87171':td.gap>0.4?'#fbbf24':'#4ade80';
+    document.getElementById('gap-text').textContent=
+        td.gap>0.7?'High uncertainty — model is guessing':
+        td.gap>0.4?'Moderate — still deciding':
+        'Low — model is confident';
+
+    // Loss chart
+    const lc=document.getElementById('loss-chart');
+    const lctx=lc.getContext('2d');
+    lctx.clearRect(0,0,240,80);
+    const maxLoss=Math.max(...tickData.ticks.map(t=>t.loss));
+    tickData.ticks.forEach((tk,i)=>{
+        const x=i/15*230+5, h=tk.loss/maxLoss*70;
+        lctx.fillStyle=i===t?'#4ade80':tk.correct?'rgba(74,222,128,0.3)':'rgba(248,113,113,0.3)';
+        lctx.fillRect(x-4,75-h,8,h);
+    });
+
+    // Per-tick predictions text
+    const tp=document.getElementById('tick-preds');
+    tp.innerHTML=tickData.ticks.map((tk,i)=>{
+        const c=tk.correct?'#4ade80':'#f87171';
+        const bg=i===t?'background:#1a1a2e;':'';
+        return `<span style="color:${c};${bg}padding:1px 3px;border-radius:2px;">${CLASSES[tk.pred]}</span>`;
+    }).join(' ');
+
+    // Tick bar
+    document.querySelectorAll('.tick').forEach((el,i)=>{
+        el.className='tick'+(i===t?' active':'');
+        const tk=tickData.ticks[i];
+        el.querySelector('.tp').textContent=CLASSES[tk.pred];
+        el.querySelector('.tp').style.color=tk.correct?'#4ade80':'#f87171';
+    });
+
+    // Canvas
+    drawCanvas();
+}
+
+function drawCanvas(){
+    const canvas=document.getElementById('c');
+    const r=canvas.parentElement.getBoundingClientRect();
+    canvas.width=r.width*devicePixelRatio;canvas.height=r.height*devicePixelRatio;
+    const ctx=canvas.getContext('2d'),W=canvas.width,H=canvas.height;
+    ctx.fillStyle='#0a0a0f';ctx.fillRect(0,0,W,H);
+
+    if(!tickData)return;
+    const d=5,t=currentTick,td=tickData.ticks[t];
+
+    // ─── Left: Surface code lattice ─────────────────────
+    const lSize=Math.min(W*0.4,H*0.7);
+    const ox=W*0.22-lSize/2, oy=H*0.45-lSize/2;
+    const cw=lSize/d,ch=lSize/d;
+
+    // Data qubits
+    for(let row=0;row<d;row++) for(let col=0;col<d;col++){
+        const q=row*d+col, x=ox+(col+.5)*cw, y=oy+(row+.5)*ch;
+        const hasX=tickData.xErr[q], hasZ=tickData.zErr[q];
+        const color=hasX&&hasZ?'rgba(200,80,200,0.8)':hasX?'rgba(255,80,80,0.7)':
+            hasZ?'rgba(80,80,255,0.7)':'rgba(60,60,80,0.4)';
+        ctx.beginPath();ctx.arc(x,y,cw*.25,0,Math.PI*2);
+        ctx.fillStyle=color;ctx.fill();
+    }
+
+    // Syndrome indicators
+    tickData.synBits.forEach((fired,si)=>{
+        if(!fired)return;
+        const row=Math.floor(si/4),col=si%4;
+        const x=ox+(col+1)*cw, y=oy+(row+.5)*ch;
+        ctx.fillStyle=si<12?'rgba(255,200,50,0.5)':'rgba(50,255,200,0.5)';
+        ctx.fillRect(x-cw*.1,y-ch*.1,cw*.2,ch*.2);
+    });
+
+    // Prediction label
+    ctx.fillStyle=td.correct?'#4ade80':'#f87171';
+    ctx.font=`bold ${28*devicePixelRatio}px monospace`;
+    ctx.textAlign='center';
+    ctx.fillText(CLASSES[td.pred],W*.22,oy+lSize+40*devicePixelRatio);
+    ctx.font=`${11*devicePixelRatio}px monospace`;
+    ctx.fillStyle='rgba(255,255,255,0.3)';
+    ctx.fillText(`tick ${t} | true: ${CLASSES[tickData.label]}`,W*.22,oy+lSize+60*devicePixelRatio);
+
+    // ─── Right: Thinking trajectory ─────────────────────
+    const tx=W*.5, tw=W*.45, ty=H*.1, th=H*.75;
+    const maxLoss=Math.max(...tickData.ticks.map(t=>t.loss));
+    const maxGap=Math.max(...tickData.ticks.map(t=>t.gap));
+
+    // Axes
+    ctx.strokeStyle='rgba(255,255,255,0.1)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(tx,ty);ctx.lineTo(tx,ty+th);ctx.lineTo(tx+tw,ty+th);ctx.stroke();
+
+    // Per-tick bars: loss + gap stacked
+    tickData.ticks.forEach((tk,i)=>{
+        const x=tx+(i/15)*tw*0.95+tw*0.025;
+        const lossH=(tk.loss/maxLoss)*th*0.6;
+        const gapH=(tk.gap/maxGap)*th*0.3;
+        const isActive=i===t;
+
+        // Loss bar
+        ctx.fillStyle=tk.correct?
+            (isActive?'rgba(74,222,128,0.8)':'rgba(74,222,128,0.25)'):
+            (isActive?'rgba(248,113,113,0.8)':'rgba(248,113,113,0.25)');
+        ctx.fillRect(x-6,ty+th-lossH,12,lossH);
+
+        // Gap bar on top
+        ctx.fillStyle=isActive?'rgba(251,191,36,0.6)':'rgba(251,191,36,0.15)';
+        ctx.fillRect(x-8,ty+th-lossH-gapH-3,16,gapH);
+
+        // Active marker
+        if(isActive){
+            ctx.strokeStyle='#4ade80';ctx.lineWidth=2;
+            ctx.strokeRect(x-10,ty-5,20,th+10);
+        }
+    });
+
+    // Loss line connecting bars
+    ctx.beginPath();ctx.strokeStyle='rgba(255,255,255,0.4)';ctx.lineWidth=1.5;
+    tickData.ticks.forEach((tk,i)=>{
+        const x=tx+(i/15)*tw*0.95+tw*0.025;
+        const y=ty+th-(tk.loss/maxLoss)*th*0.6;
+        i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+
+    // Labels
+    ctx.fillStyle='rgba(255,255,255,0.2)';ctx.font=`${9*devicePixelRatio}px monospace`;
+    ctx.textAlign='left';
+    ctx.fillText('loss',tx+2,ty-3);
+    ctx.fillStyle='rgba(251,191,36,0.3)';
+    ctx.fillText('gap (uncertainty)',tx+tw-80*devicePixelRatio,ty-3);
+}
+
+init();
+</script>
+</body>
+</html>
