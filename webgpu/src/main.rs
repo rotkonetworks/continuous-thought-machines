@@ -7,6 +7,7 @@
 //! WASM: detects mode from URL query (?mode=hebbian or default debugger)
 //! Native: pass --hebbian flag or a JSONL path
 
+mod corrector;
 mod data;
 mod gpu_render;
 mod gpu_scene;
@@ -83,6 +84,8 @@ struct HebbianState {
     bounds: Option<data::BoundsInfo>,
     use_t10: bool,
     per_image: bool,
+    forward_correction: bool,
+    correction_alpha: f32,
     animating: bool,
     animation_speed: usize,
     show_base: bool,
@@ -145,6 +148,8 @@ impl HebbianState {
             bounds: meta.bounds,
             use_t10: false,
             per_image: false,
+            forward_correction: false,
+            correction_alpha: 0.1,
             animating: false,
             animation_speed: 5,
             show_base: true,
@@ -300,6 +305,16 @@ impl App {
             ui.separator();
             dirty |= ui.checkbox(&mut state.use_t10, "Early exit T=10").changed();
             dirty |= ui.checkbox(&mut state.per_image, "Per-image (no accumulation)").changed();
+
+            ui.separator();
+            ui.heading("Forward Correction");
+            dirty |= ui.checkbox(&mut state.forward_correction, "SDP-guided correction").changed();
+            if state.forward_correction {
+                dirty |= ui.add(egui::Slider::new(&mut state.correction_alpha, 0.01..=0.5)
+                    .text("α")).changed();
+                ui.label(egui::RichText::new("Nudges activations toward\nSDP-optimal at each tick")
+                    .small().color(egui::Color32::from_gray(120)));
+            }
 
             if dirty {
                 state.engine.reset();
