@@ -574,10 +574,10 @@ pub fn render_hebbian(
             let base_ok = eval.base_correct[i];
 
             let color = match (base_ok, correct) {
-                (false, true) => Color32::from_rgb(46, 204, 113),  // fixed by Hebbian
-                (true, true) => Color32::from_rgb(100, 180, 100),  // both correct
-                (true, false) => Color32::from_rgb(230, 126, 34),  // broken by Hebbian
-                (false, false) => Color32::from_rgb(100, 60, 60),  // both wrong
+                (false, true) => Color32::from_rgb(0, 255, 100),   // fixed by Hebbian — bright green
+                (true, true) => Color32::from_rgb(80, 140, 220),   // both correct — blue
+                (true, false) => Color32::from_rgb(255, 100, 0),   // broken by Hebbian — orange
+                (false, false) => Color32::from_rgb(120, 50, 50),  // both wrong — dark red
             };
 
             let alpha = 0.3 + 0.6 * (i as f32 / show as f32);
@@ -590,10 +590,10 @@ pub fn render_hebbian(
     let legend_x = rect.max.x - 140.0;
     let legend_y = rect.max.y - 80.0;
     let legends = [
-        (Color32::from_rgb(46, 204, 113), "Fixed by Hebbian"),
-        (Color32::from_rgb(100, 180, 100), "Both correct"),
-        (Color32::from_rgb(230, 126, 34), "Broken"),
-        (Color32::from_rgb(100, 60, 60), "Both wrong"),
+        (Color32::from_rgb(0, 255, 100), "Fixed by Hebbian"),
+        (Color32::from_rgb(80, 140, 220), "Both correct"),
+        (Color32::from_rgb(255, 100, 0), "Broken"),
+        (Color32::from_rgb(120, 50, 50), "Both wrong"),
     ];
     for (i, (color, label)) in legends.iter().enumerate() {
         let y = legend_y + i as f32 * 16.0;
