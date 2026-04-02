@@ -27,28 +27,51 @@
     <script type="module">
         const status = document.getElementById('status');
 
-        // 1. Load ONNX model (for live inference on user images)
-        status.textContent = 'Loading ONNX model (1.3MB)...';
-        let onnxSession = null;
+        // 1. Load ONNX models
+        status.textContent = 'Loading ONNX models...';
+
+        // QEC decoder (real trained model, 1.4MB)
+        let qecSession = null;
         try {
-            onnxSession = await ort.InferenceSession.create('assets/hebbian/ctm_small.onnx', {
+            qecSession = await ort.InferenceSession.create('assets/hebbian/qec_decoder.onnx', {
                 executionProviders: ['wasm'],
             });
-            status.textContent = 'ONNX model loaded. Loading WASM...';
+            console.log('QEC ONNX loaded');
         } catch (e) {
-            console.warn('ONNX load failed (optional):', e);
-            status.textContent = 'Loading WASM (ONNX unavailable)...';
+            console.warn('QEC ONNX failed:', e);
         }
 
-        // 2. Expose ONNX inference to Rust via global function
-        window.onnxInfer = async function(inputFloat32Array) {
-            if (!onnxSession) return null;
-            const tensor = new ort.Tensor('float32', inputFloat32Array, [1, 1, 64]);
-            const results = await onnxSession.run({ input: tensor });
+        // ImageNet small CTM (1.3MB)
+        let imagenetSession = null;
+        try {
+            imagenetSession = await ort.InferenceSession.create('assets/hebbian/ctm_small.onnx', {
+                executionProviders: ['wasm'],
+            });
+            console.log('ImageNet ONNX loaded');
+        } catch (e) {
+            console.warn('ImageNet ONNX failed:', e);
+        }
+
+        status.textContent = 'Models loaded. Loading WASM...';
+
+        // 2. Expose REAL inference to Rust
+        window.qecInfer = async function(syndromeFloat32Array) {
+            if (!qecSession) return null;
+            const tensor = new ort.Tensor('float32', syndromeFloat32Array, [1, 120]);
+            const results = await qecSession.run({ syndrome: tensor });
             return {
-                predictions: results.predictions.data,
-                certainties: results.certainties.data,
-                sync: results.sync.data,
+                predictions: Array.from(results.predictions.data),  // [4, 16]
+                sync: Array.from(results.sync.data),                // [64]
+            };
+        };
+
+        window.imagenetInfer = async function(inputFloat32Array) {
+            if (!imagenetSession) return null;
+            const tensor = new ort.Tensor('float32', inputFloat32Array, [1, 1, 64]);
+            const results = await imagenetSession.run({ input: tensor });
+            return {
+                predictions: Array.from(results.predictions.data),
+                sync: Array.from(results.sync.data),
             };
         };
 
