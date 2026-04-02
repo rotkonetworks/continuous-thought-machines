@@ -227,7 +227,7 @@ let stats = {total:0, correct:0}, playing = false, playTimer = null;
 
 async function init() {
     try {
-        session = await ort.InferenceSession.create('assets/hebbian/qec_decoder_v2.onnx',
+        session = await ort.InferenceSession.create('assets/hebbian/qec_decoder_v3.onnx',
             {executionProviders:['wasm']});
         document.getElementById('status').textContent = 'ready';
         document.getElementById('status').style.color = '#4ade80';
