@@ -651,6 +651,8 @@ pub fn render_bounds_3d(
         }
     }
 
+    let has_sdp = !bounds.tick_achieved.is_empty() && !bounds.tick_bounds.is_empty();
+
     if has_tick_data {
         let losses = &bounds.tick_losses;
         let max_loss = losses.iter().cloned().fold(0.0_f64, f64::max).max(0.001);
@@ -658,61 +660,143 @@ pub fn render_bounds_3d(
         let ot_set: std::collections::HashSet<usize> =
             bounds.overthinking_ticks.iter().copied().collect();
 
-        // ─── Per-tick columns ───────────────────────────────────
-        let mut prev_screen: Option<Pos2> = None;
+        // If we have SDP data, use achieved/bound for bar heights
+        let max_achieved = if has_sdp {
+            bounds.tick_achieved.iter().cloned().fold(0.0_f64, f64::max).max(0.001)
+        } else {
+            max_loss
+        };
+
+        // ─── Per-tick columns: ACHIEVED (outer) + BOUND (inner) ─
+        let mut prev_achieved: Option<Pos2> = None;
+        let mut prev_bound: Option<Pos2> = None;
 
         for t in 0..n_ticks.min(50) {
             let frac = t as f32 / n_ticks.max(1) as f32;
             let x = frac * 3.5 - 1.75;
-            let loss = losses.get(t).copied().unwrap_or(0.0);
-            let normalized = (loss / max_loss) as f32;
-            let bar_height = normalized * 1.5;
 
             let is_best = t == best_tick;
             let is_ot = ot_set.contains(&t);
 
-            // Column color
-            let color = if is_best {
-                Color32::from_rgb(46, 204, 113)   // green — best tick
-            } else if is_ot {
-                Color32::from_rgb(231, 76, 60)     // red — overthinking
-            } else {
-                Color32::from_rgb(91, 138, 245)    // blue — productive
-            };
+            if has_sdp {
+                let achieved = bounds.tick_achieved.get(t).copied().unwrap_or(0.0);
+                let bound = bounds.tick_bounds.get(t).copied().unwrap_or(0.0);
+                let gap = bounds.tick_gaps.get(t).copied().unwrap_or(0.0);
 
-            // Draw bar
-            if let (Some((top, _)), Some((bot, _))) = (
-                camera.project(Vec3::new(x, -bar_height, 0.0), center),
-                camera.project(Vec3::new(x, 0.0, 0.0), center),
-            ) {
-                let width = if is_best { 6.0 } else { 4.0 };
-                painter.line_segment([top, bot], Stroke::new(width, color));
-            }
+                let ach_height = (achieved / max_achieved) as f32 * 1.5;
+                let bnd_height = (bound / max_achieved) as f32 * 1.5;
 
-            // Thinking trajectory line (connecting tops of bars)
-            if let Some((top, _)) = camera.project(Vec3::new(x, -bar_height, 0.0), center) {
-                if let Some(prev) = prev_screen {
-                    painter.line_segment([prev, top],
-                        Stroke::new(2.0, Color32::WHITE.linear_multiply(0.6)));
+                // Achieved bar (outer, wider) — what the model DOES
+                let ach_color = if is_best {
+                    Color32::from_rgb(46, 204, 113)
+                } else if is_ot {
+                    Color32::from_rgb(180, 60, 60)
+                } else {
+                    Color32::from_rgb(80, 100, 180)
+                };
+
+                if let (Some((top, _)), Some((bot, _))) = (
+                    camera.project(Vec3::new(x, -ach_height, 0.0), center),
+                    camera.project(Vec3::new(x, 0.0, 0.0), center),
+                ) {
+                    painter.line_segment([top, bot], Stroke::new(8.0, ach_color.linear_multiply(0.4)));
                 }
-                // Dot at top
-                painter.circle_filled(top, 3.0, color);
-                prev_screen = Some(top);
+
+                // Bound bar (inner, thinner, brighter) — what's POSSIBLE
+                if let (Some((top, _)), Some((bot, _))) = (
+                    camera.project(Vec3::new(x, -bnd_height, 0.0), center),
+                    camera.project(Vec3::new(x, 0.0, 0.0), center),
+                ) {
+                    painter.line_segment([top, bot],
+                        Stroke::new(3.0, Color32::from_rgb(255, 220, 50)));
+                }
+
+                // Gap shading between achieved and bound (the waste)
+                if let (Some((ach_top, _)), Some((bnd_top, _))) = (
+                    camera.project(Vec3::new(x, -ach_height, 0.0), center),
+                    camera.project(Vec3::new(x, -bnd_height, 0.0), center),
+                ) {
+                    if ach_height > bnd_height {
+                        painter.line_segment([ach_top, bnd_top],
+                            Stroke::new(6.0, Color32::from_rgba_premultiplied(200, 50, 50, 30)));
+                    }
+                }
+
+                // Trajectory lines
+                if let Some((ach_top, _)) = camera.project(Vec3::new(x, -ach_height, 0.0), center) {
+                    if let Some(prev) = prev_achieved {
+                        painter.line_segment([prev, ach_top],
+                            Stroke::new(2.0, ach_color.linear_multiply(0.7)));
+                    }
+                    painter.circle_filled(ach_top, 3.0, ach_color);
+                    prev_achieved = Some(ach_top);
+                }
+                if let Some((bnd_top, _)) = camera.project(Vec3::new(x, -bnd_height, 0.0), center) {
+                    if let Some(prev) = prev_bound {
+                        painter.line_segment([prev, bnd_top],
+                            Stroke::new(1.5, Color32::from_rgb(255, 220, 50).linear_multiply(0.7)));
+                    }
+                    painter.circle_filled(bnd_top, 2.0, Color32::from_rgb(255, 220, 50));
+                    prev_bound = Some(bnd_top);
+                }
+            } else {
+                // Fallback: just loss bars (no SDP data)
+                let loss = losses.get(t).copied().unwrap_or(0.0);
+                let bar_height = (loss / max_loss) as f32 * 1.5;
+
+                let color = if is_best {
+                    Color32::from_rgb(46, 204, 113)
+                } else if is_ot {
+                    Color32::from_rgb(231, 76, 60)
+                } else {
+                    Color32::from_rgb(91, 138, 245)
+                };
+
+                if let (Some((top, _)), Some((bot, _))) = (
+                    camera.project(Vec3::new(x, -bar_height, 0.0), center),
+                    camera.project(Vec3::new(x, 0.0, 0.0), center),
+                ) {
+                    painter.line_segment([top, bot], Stroke::new(4.0, color));
+                }
+                if let Some((top, _)) = camera.project(Vec3::new(x, -bar_height, 0.0), center) {
+                    if let Some(prev) = prev_achieved {
+                        painter.line_segment([prev, top],
+                            Stroke::new(2.0, Color32::WHITE.linear_multiply(0.6)));
+                    }
+                    painter.circle_filled(top, 3.0, color);
+                    prev_achieved = Some(top);
+                }
             }
 
-            // Tick labels (every 5 or at best tick)
-            if t % 10 == 0 || is_best {
+            // Tick labels
+            if t % 5 == 0 || is_best {
                 if let Some((pos, _)) = camera.project(Vec3::new(x, 0.12, 0.0), center) {
-                    let label = if is_best {
-                        format!("t{}★", t)
-                    } else {
-                        format!("t{}", t)
-                    };
+                    let label = if is_best { format!("t{}★", t) } else { format!("t{}", t) };
                     painter.text(pos, egui::Align2::CENTER_TOP, label,
                         egui::FontId::monospace(8.0),
                         if is_best { Color32::from_rgb(46, 204, 113) }
                         else { Color32::from_gray(90) });
                 }
+            }
+        }
+
+        // Legend
+        if has_sdp {
+            let leg_x = rect.max.x - 170.0;
+            let leg_y = rect.min.y + 40.0;
+            let items = [
+                (Color32::from_rgb(80, 100, 180), "Achieved (model)", 8.0),
+                (Color32::from_rgb(255, 220, 50), "Bound (optimal)", 3.0),
+                (Color32::from_rgba_premultiplied(200, 50, 50, 100), "Gap (wasted)", 6.0),
+            ];
+            for (i, (color, label, _)) in items.iter().enumerate() {
+                let y = leg_y + i as f32 * 16.0;
+                painter.line_segment(
+                    [Pos2::new(leg_x, y + 6.0), Pos2::new(leg_x + 20.0, y + 6.0)],
+                    Stroke::new(3.0, *color));
+                painter.text(Pos2::new(leg_x + 25.0, y),
+                    egui::Align2::LEFT_TOP, *label,
+                    egui::FontId::monospace(9.0), Color32::from_gray(180));
             }
         }
 

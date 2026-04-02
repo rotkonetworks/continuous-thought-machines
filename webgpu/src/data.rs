@@ -272,4 +272,11 @@ pub struct BoundsInfo {
     pub overthinking_ticks: Vec<usize>, // which ticks are overthinking
     #[serde(default)]
     pub neuron_contributions: Vec<f64>, // [top_k] sorted neuron contributions
+    // SDP per-tick bounds (achieved vs optimal)
+    #[serde(default)]
+    pub tick_achieved: Vec<f64>,   // [n_ticks] NLM achieved loss per tick
+    #[serde(default)]
+    pub tick_bounds: Vec<f64>,     // [n_ticks] SDP optimal bound per tick
+    #[serde(default)]
+    pub tick_gaps: Vec<f64>,       // [n_ticks] achieved - bound = wasted
 }
