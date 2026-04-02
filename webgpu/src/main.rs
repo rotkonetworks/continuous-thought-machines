@@ -409,9 +409,9 @@ impl App {
                     state.show_base, step,
                 );
 
-                // Render bounds overlay on top
+                // Render bounds in 3D space
                 if let Some(ref bounds) = state.bounds {
-                    render::render_bounds_overlay(&painter, response.rect, bounds);
+                    render::render_bounds_3d(&painter, response.rect, bounds, &self.camera);
                 }
             });
     }
