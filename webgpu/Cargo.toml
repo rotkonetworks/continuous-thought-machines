@@ -11,10 +11,12 @@ path = "src/main.rs"
 [dependencies]
 # GPU rendering + GUI
 egui = "0.31"
-eframe = { version = "0.31", default-features = false, features = ["glow"] }
+eframe = { version = "0.31", default-features = false, features = ["wgpu"] }
+wgpu = "24"
 
 # 3D math
 glam = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
 
 # Data
 serde = { version = "1", features = ["derive"] }

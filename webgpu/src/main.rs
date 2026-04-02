@@ -8,6 +8,7 @@
 //! Native: pass --hebbian flag or a JSONL path
 
 mod data;
+mod gpu_render;
 mod hebbian;
 mod qec;
 mod render;
