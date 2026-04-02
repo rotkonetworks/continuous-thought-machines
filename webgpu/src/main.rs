@@ -355,32 +355,32 @@ impl App {
             ui.checkbox(&mut state.show_base, "Show base accuracy");
 
             ui.separator();
-            ui.heading("Info");
-            ui.label(format!("Images: {}", n));
+            ui.heading("Live Stats");
+            ui.label(format!("Images: {}/{}", step, n));
             ui.label(format!("Sync dims: {}", state.engine.n_synch));
-            ui.label(format!("Classes: {}", state.engine.n_output));
             ui.label(format!("Delta norm: {:.1}", state.engine.delta_norm()));
             ui.label("Zero backward passes");
 
-            // Bound analysis results
-            if let Some(ref b) = state.bounds {
+            // Live gap stats (computed from actual data)
+            if step > 0 {
+                let gaps = &state.eval.per_image_gaps[..step.min(n)];
+                let mean_gap: f32 = gaps.iter().sum::<f32>() / gaps.len() as f32;
+                let max_gap = gaps.iter().cloned().fold(0.0_f32, f32::max);
+
                 ui.separator();
-                ui.heading("Bound Analysis");
-                ui.label(format!("Neurons: {} ({} dead)", b.model_dim, b.n_dead));
-                ui.label(format!("Diversity: {:.3}", b.neuron_diversity));
+                ui.heading("Live Bound Gap");
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 190, 40),
+                    format!("Mean gap: {:.4}", mean_gap));
+                ui.label(format!("Max gap: {:.4}", max_gap));
+
+                // How many images would benefit from correction?
+                let correctable = gaps.iter().filter(|&&g| g > 0.01).count();
                 ui.colored_label(
                     egui::Color32::from_rgb(245, 166, 35),
-                    format!("Synapse util: {:.1}%", b.synapse_utilization_pct));
-                ui.label(format!("  capacity rank: {}", b.synapse_rank_90));
-                ui.label(format!("  activation rank: {}", b.synapse_activation_rank));
-                ui.label(format!("  condition: {:.0}", b.synapse_condition));
-                ui.colored_label(
-                    egui::Color32::from_rgb(231, 76, 60),
-                    format!("Overthinking: {}/{} ticks", b.n_overthinking, b.n_ticks));
-                ui.label(format!("Best tick: {}", b.best_tick));
-                ui.colored_label(
-                    egui::Color32::from_rgb(91, 138, 245),
-                    format!("Bottleneck: {}", b.bottleneck));
+                    format!("Correctable: {}/{} ({:.0}%)",
+                        correctable, gaps.len(),
+                        correctable as f32 / gaps.len() as f32 * 100.0));
             }
         });
 
@@ -475,13 +475,10 @@ impl App {
                     state.show_base, step,
                 );
 
-                // Render live per-image gaps + static bounds reference
+                // Everything live — no static precomputed data
                 render::render_live_gaps(
                     &painter, response.rect, &state.eval, &self.camera, step,
                 );
-                if let Some(ref bounds) = state.bounds {
-                    render::render_bounds_3d(&painter, response.rect, bounds, &self.camera);
-                }
             });
     }
 
