@@ -631,8 +631,8 @@ impl App {
                         match (xe, ze) { (false,false)=>0, (true,false)=>1, (false,true)=>2, _=>3 }
                     };
 
-                    // CTM spatial decoder (same as animated version)
-                    let ctm_pred = if total_f == 0 { 0 } else { mwpm_pred };
+                    // CTM uses same parity decoder here (real CTM needs ONNX)
+                    let ctm_pred = mwpm_pred;
 
                     state.total += 1;
                     if ctm_pred == result.label { state.correct += 1; }
@@ -647,6 +647,7 @@ impl App {
             if ui.button("Reset stats").clicked() {
                 state.total = 0;
                 state.correct = 0;
+                state.mwpm_correct = 0;
             }
 
             ui.separator();
