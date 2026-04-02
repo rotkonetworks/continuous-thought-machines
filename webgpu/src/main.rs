@@ -82,6 +82,7 @@ struct HebbianState {
     eval: EvalState,
     bounds: Option<data::BoundsInfo>,
     use_t10: bool,
+    per_image: bool,
     animating: bool,
     animation_speed: usize,
     show_base: bool,
@@ -143,6 +144,7 @@ impl HebbianState {
             eval,
             bounds: meta.bounds,
             use_t10: false,
+            per_image: false,
             animating: false,
             animation_speed: 5,
             show_base: true,
@@ -238,7 +240,7 @@ impl App {
 
         // Run evaluation if dirty
         if state.eval.dirty {
-            state.eval.run_full(&mut state.engine, state.use_t10);
+            state.eval.run_full_mode(&mut state.engine, state.use_t10, state.per_image);
         }
 
         // Animate: advance N steps per frame
@@ -297,6 +299,7 @@ impl App {
 
             ui.separator();
             dirty |= ui.checkbox(&mut state.use_t10, "Early exit T=10").changed();
+            dirty |= ui.checkbox(&mut state.per_image, "Per-image (no accumulation)").changed();
 
             if dirty {
                 state.engine.reset();

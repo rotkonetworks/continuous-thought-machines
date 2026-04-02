@@ -135,6 +135,57 @@ impl HebbianEngine {
         argmax(&logits)
     }
 
+    /// Per-image correction: compute fresh delta from THIS image only.
+    /// No accumulation, no memory. Uses novelty from baseline directly.
+    pub fn predict_per_image(&self, sync: &[f32], base_logits: &[f32]) -> usize {
+        let logits = self.apply_per_image(sync, base_logits);
+        argmax(&logits)
+    }
+
+    /// Per-image apply: correction from single-sample novelty, no accumulated delta.
+    pub fn apply_per_image(&self, sync: &[f32], base_logits: &[f32]) -> Vec<f32> {
+        // Novelty
+        let mut novelty = vec![0.0f32; self.n_synch];
+        for i in 0..self.n_synch {
+            novelty[i] = sync[i] - self.baseline_sync[i];
+        }
+
+        // Gate
+        let threshold = percentile_abs(&novelty, self.gate_percentile);
+        let mut gated = vec![0.0f32; self.n_synch];
+        for i in 0..self.n_synch {
+            if novelty[i].abs() > threshold {
+                gated[i] = novelty[i];
+            }
+        }
+
+        // Action signal = W @ gated
+        let mut action = vec![0.0f32; self.n_output];
+        for o in 0..self.n_output {
+            let row_start = o * self.n_synch;
+            let mut sum = 0.0f32;
+            for s in 0..self.n_synch {
+                sum += self.output_weights[row_start + s] * gated[s];
+            }
+            action[o] = sum;
+        }
+
+        // Single-shot delta = lr * outer(gated, action)
+        // Apply directly: correction_o = Σ_s sync[s] * lr * gated[s] * action[o]
+        // = lr * (sync · gated) * action[o]
+        let mut sync_dot_gated = 0.0f32;
+        for s in 0..self.n_synch {
+            sync_dot_gated += sync[s] * gated[s];
+        }
+        let scale = self.lr * sync_dot_gated;
+
+        let mut result = vec![0.0f32; self.n_output];
+        for o in 0..self.n_output {
+            result[o] = base_logits[o] + scale * action[o];
+        }
+        result
+    }
+
     /// Current delta matrix L2 norm.
     pub fn delta_norm(&self) -> f32 {
         self.delta.iter().map(|x| x * x).sum::<f32>().sqrt()
@@ -204,6 +255,12 @@ impl EvalState {
 
     /// Run full evaluation with the given engine. ~2s for 200 images in WASM.
     pub fn run_full(&mut self, engine: &mut HebbianEngine, use_t10: bool) {
+        self.run_full_mode(engine, use_t10, false);
+    }
+
+    /// Run full evaluation. If per_image=true, each image gets a fresh
+    /// correction (no accumulation). Otherwise, delta accumulates.
+    pub fn run_full_mode(&mut self, engine: &mut HebbianEngine, use_t10: bool, per_image: bool) {
         engine.reset();
         let mut correct_so_far = 0u32;
 
@@ -215,21 +272,27 @@ impl EvalState {
                 &self.logits_final[i * self.n_output..(i + 1) * self.n_output]
             };
 
-            let pred = engine.predict(sync, logits);
+            let pred = if per_image {
+                engine.predict_per_image(sync, logits)
+            } else {
+                engine.predict(sync, logits)
+            };
             let label = self.labels[i] as usize;
             let correct = pred == label;
 
             self.hebbian_correct[i] = correct;
             self.hebbian_preds[i] = pred as u16;
 
-            // Reward-modulated update (positive reinforcement only)
-            engine.update(sync, correct);
+            if !per_image {
+                // Accumulated: reward-modulated update
+                engine.update(sync, correct);
+            }
 
             if correct {
                 correct_so_far += 1;
             }
             self.cumulative_acc[i] = correct_so_far as f32 / (i + 1) as f32;
-            self.delta_norms[i] = engine.delta_norm();
+            self.delta_norms[i] = if per_image { 0.0 } else { engine.delta_norm() };
         }
 
         self.current_step = self.n_images;
