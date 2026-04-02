@@ -475,7 +475,10 @@ impl App {
                     state.show_base, step,
                 );
 
-                // Render bounds in 3D space
+                // Render live per-image gaps + static bounds reference
+                render::render_live_gaps(
+                    &painter, response.rect, &state.eval, &self.camera, step,
+                );
                 if let Some(ref bounds) = state.bounds {
                     render::render_bounds_3d(&painter, response.rect, bounds, &self.camera);
                 }

@@ -212,6 +212,7 @@ pub struct EvalState {
     pub hebbian_preds: Vec<u16>,
     pub cumulative_acc: Vec<f32>,   // running accuracy at each step
     pub delta_norms: Vec<f32>,
+    pub per_image_gaps: Vec<f32>,   // SDP gap per image (computed live)
 
     // Animation state
     pub current_step: usize,
@@ -248,6 +249,7 @@ impl EvalState {
             hebbian_preds: vec![0; n_images],
             cumulative_acc: vec![0.0; n_images],
             delta_norms: vec![0.0; n_images],
+            per_image_gaps: vec![0.0; n_images],
             current_step: 0,
             dirty: true,
         }
@@ -260,12 +262,18 @@ impl EvalState {
 
     /// Run full evaluation. If per_image=true, each image gets a fresh
     /// correction (no accumulation). Otherwise, delta accumulates.
+    /// Computes per-image SDP gap live using the corrector.
     pub fn run_full_mode(&mut self, engine: &mut HebbianEngine, use_t10: bool, per_image: bool) {
         engine.reset();
         let mut correct_so_far = 0u32;
 
+        // Corrector for live gap computation
+        // Use sync as proxy for trace (sync ≈ pairwise products of activations)
+        // Gap = how far current sync is from its own optimal projection
+        let n_s = self.n_synch;
+
         for i in 0..self.n_images {
-            let sync = &self.sync_signals[i * self.n_synch..(i + 1) * self.n_synch];
+            let sync = &self.sync_signals[i * n_s..(i + 1) * n_s];
             let logits = if use_t10 {
                 &self.logits_t10[i * self.n_output..(i + 1) * self.n_output]
             } else {
@@ -283,8 +291,18 @@ impl EvalState {
             self.hebbian_correct[i] = correct;
             self.hebbian_preds[i] = pred as u16;
 
+            // Compute live gap: distance between current logits and corrected logits
+            let corrected = engine.apply_per_image(sync, logits);
+            let mut gap_sq = 0.0f32;
+            let mut base_sq = 0.0f32;
+            for o in 0..self.n_output {
+                let diff = logits[o] - corrected[o];
+                gap_sq += diff * diff;
+                base_sq += logits[o] * logits[o];
+            }
+            self.per_image_gaps[i] = if base_sq > 1e-10 { gap_sq / base_sq } else { 0.0 };
+
             if !per_image {
-                // Accumulated: reward-modulated update
                 engine.update(sync, correct);
             }
 

@@ -615,6 +615,65 @@ pub fn render_hebbian(
     }
 }
 
+/// Render live per-image gaps computed in real-time by the Hebbian engine.
+/// Each image gets a dot whose SIZE = gap (bigger = more correction possible).
+/// Plotted on the Z-axis alongside the accuracy curve.
+pub fn render_live_gaps(
+    painter: &Painter,
+    rect: Rect,
+    eval: &crate::hebbian::EvalState,
+    camera: &Camera,
+    step: usize,
+) {
+    let n = eval.n_images;
+    if n == 0 || step == 0 { return; }
+    let show = step.min(n);
+    let center = rect.center();
+
+    // Per-image gap as bars on Z=+0.5 (behind the accuracy curve at Z=-1.5)
+    let max_gap = eval.per_image_gaps.iter().take(show)
+        .cloned().fold(0.0_f32, f32::max).max(0.001);
+
+    let mut prev_screen: Option<Pos2> = None;
+
+    for i in 0..show {
+        let x = (i as f32 / n as f32) * 3.0 - 1.5;
+        let gap = eval.per_image_gaps[i];
+        let gap_normalized = gap / max_gap;
+        let y = -gap_normalized * 1.0;  // gap bars grow downward
+        let z = 0.5;  // slightly in front of accuracy curve
+
+        if let Some((screen, depth)) = camera.project(Vec3::new(x, y, z), center) {
+            // Color: yellow-orange for gap (more gap = more orange)
+            let r = (200.0 + 55.0 * gap_normalized) as u8;
+            let g = (200.0 - 100.0 * gap_normalized) as u8;
+            let color = Color32::from_rgb(r, g, 30);
+
+            let alpha = 0.3 + 0.5 * (i as f32 / show as f32);
+            let size = 2.0 + gap_normalized * 4.0;
+            painter.circle_filled(screen, size, color.linear_multiply(alpha));
+
+            // Connect gap dots
+            if let Some(prev) = prev_screen {
+                painter.line_segment([prev, screen],
+                    Stroke::new(1.0, Color32::from_rgb(200, 180, 30).linear_multiply(0.3)));
+            }
+            prev_screen = Some(screen);
+        }
+    }
+
+    // Gap label
+    if show > 0 {
+        let mean_gap = eval.per_image_gaps.iter().take(show).sum::<f32>() / show as f32;
+        if let Some((pos, _)) = camera.project(Vec3::new(1.6, -0.5, 0.5), center) {
+            painter.text(pos, egui::Align2::LEFT_CENTER,
+                format!("Gap: {:.3}", mean_gap),
+                egui::FontId::monospace(10.0),
+                Color32::from_rgb(220, 190, 40));
+        }
+    }
+}
+
 /// Render per-tick thinking trajectory in 3D.
 ///
 /// One thing communicated clearly: at each tick, how much capacity
