@@ -263,4 +263,13 @@ pub struct BoundsInfo {
     pub n_ticks: usize,
     pub model_dim: usize,
     pub bottleneck: String,
+    // Per-tick data (if available)
+    #[serde(default)]
+    pub tick_losses: Vec<f64>,         // [n_ticks] loss at each tick
+    #[serde(default)]
+    pub tick_improvements: Vec<f64>,   // [n_ticks] improvement from prev tick
+    #[serde(default)]
+    pub overthinking_ticks: Vec<usize>, // which ticks are overthinking
+    #[serde(default)]
+    pub neuron_contributions: Vec<f64>, // [top_k] sorted neuron contributions
 }

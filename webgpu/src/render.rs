@@ -615,15 +615,14 @@ pub fn render_hebbian(
     }
 }
 
-/// Render bound analysis as a 3D architectural diagram.
+/// Render per-tick thinking trajectory in 3D.
 ///
-/// Shows the CTM as a 3D structure where you can SEE the bottleneck:
-/// - Ticks along X-axis, each a vertical slice
-/// - Synapse capacity as a wide translucent cylinder between ticks
-/// - Synapse utilization as a thin bright core inside the cylinder
-/// - Overthinking ticks glow red
-/// - Best tick glows green
-/// - Top-5 SVs shown as descending bars
+/// One thing communicated clearly: at each tick, how much capacity
+/// is used vs wasted, and whether thinking helped or hurt.
+///
+/// X = tick, Y = loss (inverted: lower = better = taller bar)
+/// Each tick is a column colored green (productive) or red (overthinking).
+/// A bright line connects the per-tick accuracy — the thinking path.
 pub fn render_bounds_3d(
     painter: &Painter,
     rect: Rect,
@@ -634,114 +633,133 @@ pub fn render_bounds_3d(
     let n_ticks = bounds.n_ticks;
     if n_ticks == 0 { return; }
 
-    // Axes
+    let has_tick_data = !bounds.tick_losses.is_empty();
+
+    // ─── Axes ───────────────────────────────────────────────────
     if let Some((origin, _)) = camera.project(Vec3::ZERO, center) {
-        let axes = [
-            (Vec3::new(2.0, 0.0, 0.0), Color32::from_rgb(255, 80, 80), "tick →"),
-            (Vec3::new(0.0, -2.0, 0.0), Color32::from_rgb(80, 255, 80), "capacity"),
-            (Vec3::new(0.0, 0.0, 1.5), Color32::from_rgb(80, 80, 255), "SVs"),
-        ];
-        for (dir, color, label) in &axes {
+        for (dir, color, label) in &[
+            (Vec3::new(2.0, 0.0, 0.0), Color32::from_rgb(200, 200, 200), "tick →"),
+            (Vec3::new(0.0, -1.8, 0.0), Color32::from_rgb(200, 200, 200), "loss ↓"),
+        ] {
             if let Some((end, _)) = camera.project(*dir * 0.8, center) {
-                painter.line_segment([origin, end], Stroke::new(1.0, color.linear_multiply(0.3)));
+                painter.line_segment([origin, end],
+                    Stroke::new(1.0, color.linear_multiply(0.2)));
                 painter.text(end + egui::Vec2::new(5.0, 0.0),
                     egui::Align2::LEFT_CENTER, label,
-                    egui::FontId::monospace(9.0), color.linear_multiply(0.5));
+                    egui::FontId::monospace(9.0), color.linear_multiply(0.4));
             }
         }
     }
 
-    // ─── Synapse capacity vs utilization (the main visual) ──────
-    // Capacity = wide translucent band, utilization = thin bright core
-    let capacity_rank = bounds.synapse_rank_90 as f32;
-    let util_rank = bounds.synapse_activation_rank as f32;
-    let max_rank = capacity_rank.max(1.0);
+    if has_tick_data {
+        let losses = &bounds.tick_losses;
+        let max_loss = losses.iter().cloned().fold(0.0_f64, f64::max).max(0.001);
+        let best_tick = bounds.best_tick;
+        let ot_set: std::collections::HashSet<usize> =
+            bounds.overthinking_ticks.iter().copied().collect();
 
-    let capacity_height = 1.5;  // full height = full rank
-    let util_height = capacity_height * (util_rank / max_rank);
+        // ─── Per-tick columns ───────────────────────────────────
+        let mut prev_screen: Option<Pos2> = None;
 
-    // Draw capacity band (wide, faint)
-    for t in 0..n_ticks.min(50) {
-        let x = (t as f32 / n_ticks as f32) * 3.0 - 1.5;
-        let is_overthinking = t as usize >= bounds.best_tick &&
-            (bounds.n_overthinking as f32 / n_ticks as f32) > 0.3;
-        let is_best = t == bounds.best_tick;
+        for t in 0..n_ticks.min(50) {
+            let frac = t as f32 / n_ticks.max(1) as f32;
+            let x = frac * 3.5 - 1.75;
+            let loss = losses.get(t).copied().unwrap_or(0.0);
+            let normalized = (loss / max_loss) as f32;
+            let bar_height = normalized * 1.5;
 
-        // Capacity bar (outer, translucent)
-        if let (Some((top, _)), Some((bot, _))) = (
-            camera.project(Vec3::new(x, -capacity_height, 0.0), center),
-            camera.project(Vec3::new(x, 0.0, 0.0), center),
-        ) {
-            let cap_color = Color32::from_rgba_premultiplied(100, 100, 200, 30);
-            painter.line_segment([top, bot], Stroke::new(12.0, cap_color));
-        }
+            let is_best = t == best_tick;
+            let is_ot = ot_set.contains(&t);
 
-        // Utilization bar (inner, bright)
-        if let (Some((top, _)), Some((bot, _))) = (
-            camera.project(Vec3::new(x, -util_height, 0.0), center),
-            camera.project(Vec3::new(x, 0.0, 0.0), center),
-        ) {
-            let util_color = if is_best {
-                Color32::from_rgb(46, 204, 113)  // green — best tick
-            } else if is_overthinking {
-                Color32::from_rgb(231, 76, 60)   // red — overthinking
+            // Column color
+            let color = if is_best {
+                Color32::from_rgb(46, 204, 113)   // green — best tick
+            } else if is_ot {
+                Color32::from_rgb(231, 76, 60)     // red — overthinking
             } else {
-                Color32::from_rgb(91, 138, 245)  // blue — normal
+                Color32::from_rgb(91, 138, 245)    // blue — productive
             };
-            painter.line_segment([top, bot], Stroke::new(4.0, util_color));
-        }
 
-        // Tick label
-        if t % 5 == 0 || is_best {
-            if let Some((pos, _)) = camera.project(Vec3::new(x, 0.15, 0.0), center) {
-                let label = if is_best { format!("t{}★", t) } else { format!("t{}", t) };
-                painter.text(pos, egui::Align2::CENTER_TOP, label,
-                    egui::FontId::monospace(8.0),
-                    if is_best { Color32::from_rgb(46, 204, 113) } else { Color32::from_gray(100) });
-            }
-        }
-    }
-
-    // ─── SVD spectrum (back wall) ───────────────────────────────
-    let svs = &bounds.synapse_top_svs;
-    if !svs.is_empty() {
-        let max_sv = svs[0] as f32;
-        for (i, &sv) in svs.iter().enumerate().take(5) {
-            let z = (i as f32 / 4.0) * 2.0 - 1.0;
-            let height = (sv as f32 / max_sv) * 1.5;
-
+            // Draw bar
             if let (Some((top, _)), Some((bot, _))) = (
-                camera.project(Vec3::new(1.6, -height, z), center),
-                camera.project(Vec3::new(1.6, 0.0, z), center),
+                camera.project(Vec3::new(x, -bar_height, 0.0), center),
+                camera.project(Vec3::new(x, 0.0, 0.0), center),
             ) {
-                let alpha = 1.0 - i as f32 * 0.15;
-                painter.line_segment([top, bot],
-                    Stroke::new(8.0, Color32::from_rgb(180, 100, 255).linear_multiply(alpha)));
-                painter.text(bot + egui::Vec2::new(0.0, 5.0),
-                    egui::Align2::CENTER_TOP,
-                    format!("σ{}={:.0}", i+1, sv),
-                    egui::FontId::monospace(8.0),
-                    Color32::from_gray(120));
+                let width = if is_best { 6.0 } else { 4.0 };
+                painter.line_segment([top, bot], Stroke::new(width, color));
             }
+
+            // Thinking trajectory line (connecting tops of bars)
+            if let Some((top, _)) = camera.project(Vec3::new(x, -bar_height, 0.0), center) {
+                if let Some(prev) = prev_screen {
+                    painter.line_segment([prev, top],
+                        Stroke::new(2.0, Color32::WHITE.linear_multiply(0.6)));
+                }
+                // Dot at top
+                painter.circle_filled(top, 3.0, color);
+                prev_screen = Some(top);
+            }
+
+            // Tick labels (every 5 or at best tick)
+            if t % 10 == 0 || is_best {
+                if let Some((pos, _)) = camera.project(Vec3::new(x, 0.12, 0.0), center) {
+                    let label = if is_best {
+                        format!("t{}★", t)
+                    } else {
+                        format!("t{}", t)
+                    };
+                    painter.text(pos, egui::Align2::CENTER_TOP, label,
+                        egui::FontId::monospace(8.0),
+                        if is_best { Color32::from_rgb(46, 204, 113) }
+                        else { Color32::from_gray(90) });
+                }
+            }
+        }
+
+        // ─── Utilization indicator (right side) ─────────────────
+        let util_x = 2.1;
+        let cap_height = 1.5;
+        let util_frac = bounds.synapse_utilization_pct as f32 / 100.0;
+
+        // Capacity (outer, faint)
+        if let (Some((top, _)), Some((bot, _))) = (
+            camera.project(Vec3::new(util_x, -cap_height, 0.0), center),
+            camera.project(Vec3::new(util_x, 0.0, 0.0), center),
+        ) {
+            painter.line_segment([top, bot],
+                Stroke::new(20.0, Color32::from_rgba_premultiplied(60, 60, 100, 40)));
+        }
+
+        // Utilization (inner, bright)
+        if let (Some((top, _)), Some((bot, _))) = (
+            camera.project(Vec3::new(util_x, -cap_height * util_frac.min(1.0), 0.0), center),
+            camera.project(Vec3::new(util_x, 0.0, 0.0), center),
+        ) {
+            painter.line_segment([top, bot],
+                Stroke::new(6.0, Color32::from_rgb(245, 166, 35)));
+        }
+
+        // Utilization label
+        if let Some((pos, _)) = camera.project(Vec3::new(util_x, 0.15, 0.0), center) {
+            painter.text(pos, egui::Align2::CENTER_TOP,
+                format!("{:.1}%", bounds.synapse_utilization_pct),
+                egui::FontId::monospace(10.0),
+                Color32::from_rgb(245, 166, 35));
+        }
+        if let Some((pos, _)) = camera.project(Vec3::new(util_x, 0.30, 0.0), center) {
+            painter.text(pos, egui::Align2::CENTER_TOP, "util",
+                egui::FontId::monospace(8.0), Color32::from_gray(100));
         }
     }
 
-    // ─── Key stats as 3D text ───────────────────────────────────
-    if let Some((pos, _)) = camera.project(Vec3::new(-1.5, -1.8, -0.5), center) {
+    // ─── Bottom labels ──────────────────────────────────────────
+    if let Some((pos, _)) = camera.project(Vec3::new(-1.75, -1.7, 0.0), center) {
         painter.text(pos, egui::Align2::LEFT_TOP,
-            format!("Utilization: {:.1}%  (rank {}/{})",
-                bounds.synapse_utilization_pct,
-                bounds.synapse_activation_rank,
-                bounds.synapse_rank_90),
-            egui::FontId::monospace(11.0),
-            Color32::from_rgb(245, 166, 35));
-    }
-
-    if let Some((pos, _)) = camera.project(Vec3::new(-1.5, -2.0, -0.5), center) {
-        painter.text(pos, egui::Align2::LEFT_TOP,
-            format!("{}", bounds.bottleneck),
+            format!("Best tick: {}  |  Overthinking: {}/{}  |  {}",
+                bounds.best_tick, bounds.n_overthinking, bounds.n_ticks,
+                bounds.bottleneck),
             egui::FontId::monospace(10.0),
-            Color32::from_rgb(91, 138, 245));
+            Color32::from_gray(160));
     }
 }
 
