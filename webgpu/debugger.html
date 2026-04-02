@@ -115,16 +115,15 @@ canvas { width: 100%; height: 100%; display: block; }
             </div>
             <div style="display:flex;align-items:center;gap:8px;margin-left:8px;">
                 <span style="color:#fbbf24;font-size:10px;">correction α</span>
-                <input type="range" id="alpha-slider" min="0" max="50" value="0" title="Experimental — may not improve accuracy"
+                <input type="range" id="alpha-slider" min="0" max="50" value="5"
                     style="width:80px;accent-color:#fbbf24;">
-                <span id="alpha-val" style="color:#fbbf24;font-size:11px;font-family:monospace;min-width:32px;">0.00</span>
+                <span id="alpha-val" style="color:#fbbf24;font-size:11px;font-family:monospace;min-width:32px;">0.05</span>
             </div>
         </div>
         <div class="header-right">
             <span>tick <span class="v" id="s-tick">—</span>/15</span>
             <span>pred <span class="v" id="s-pred">—</span></span>
             <span>loss <span class="v" id="s-loss">—</span></span>
-            <span>acc <span class="v" id="s-acc">—</span></span>
             <span>base <span class="v" id="s-base-acc">—</span></span>
             <span>corr <span class="v" id="s-corr-acc" style="color:#fbbf24;">—</span></span>
             <span id="status" style="color:#555">loading...</span>
@@ -283,7 +282,7 @@ function buildUI() {
         rib.appendChild(el);
     }
 
-    window._correctionAlpha = 0;
+    window._correctionAlpha = 0.05;
     const alphaSlider = document.getElementById('alpha-slider');
     const alphaValEl = document.getElementById('alpha-val');
     alphaSlider.oninput = () => {
@@ -422,7 +421,7 @@ async function run100() {
     const corrAcc = stats.corrTotal>0 ? (stats.corrCorrect/stats.corrTotal*100).toFixed(1)+'%' : '—';
     document.getElementById('s-base-acc').textContent = baseAcc;
     document.getElementById('s-corr-acc').textContent = corrAcc;
-    document.getElementById('s-acc').textContent = baseAcc;
+    // acc display removed — use base/corr only
     el.textContent = 'ready'; el.style.color = '#4ade80';
 }
 
@@ -450,9 +449,12 @@ function render() {
     pe.textContent = CLASSES[td.pred] + (td.correct?' ✓':' ✗');
     pe.className = 'v' + (td.correct?'':' err');
     document.getElementById('s-loss').textContent = td.loss.toFixed(3);
-    if (stats.total > 0)
-        document.getElementById('s-acc').textContent =
-            `${(stats.correct/stats.total*100).toFixed(1)}% (${stats.total})`;
+    if (stats.baseTotal > 0)
+        document.getElementById('s-base-acc').textContent =
+            `${(stats.baseCorrect/stats.baseTotal*100).toFixed(1)}%`;
+    if (stats.corrTotal > 0)
+        document.getElementById('s-corr-acc').textContent =
+            `${(stats.corrCorrect/stats.corrTotal*100).toFixed(1)}%`;
 
     // Panel tick
     document.getElementById('panel-tick').textContent = t;
@@ -578,8 +580,8 @@ function drawCanvas() {
     const t = currentTick, td = tickData.ticks[t], d = 5;
 
     // ─── Left: Surface code lattice ─────────────────────
-    const lSize = Math.min(W*0.38, H*0.65);
-    const ox = W*0.22 - lSize/2, oy = H*0.42 - lSize/2;
+    const lSize = Math.min(W*0.28, H*0.50);
+    const ox = W*0.18 - lSize/2, oy = H*0.40 - lSize/2;
     const cw = lSize/d, ch = lSize/d;
 
     // Grid lines (subtle)
