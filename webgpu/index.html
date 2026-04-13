@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CTM Hebbian Adaptation — Interactive Demo</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0a0a0a; }
+        canvas { width: 100% !important; height: 100% !important; }
+        #loading {
+            position: fixed; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #5bf58a; font: 18px monospace;
+            text-align: center; z-index: 100;
+        }
+        #loading .progress { color: #888; font-size: 14px; margin-top: 8px; }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        CTM Hebbian Adaptation Demo
+        <div class="progress" id="status">Initializing...</div>
+    </div>
+    <canvas id="ctm-canvas"></canvas>
+
+    <script type="module">
+        const status = document.getElementById('status');
+
+        // 1. Load ONNX models
+        status.textContent = 'Loading ONNX models...';
+
+        // QEC decoder (real trained model, 1.4MB)
+        let qecSession = null;
+        try {
+            qecSession = await ort.InferenceSession.create('assets/hebbian/qec_decoder.onnx', {
+                executionProviders: ['wasm'],
+            });
+            console.log('QEC ONNX loaded');
+        } catch (e) {
+            console.warn('QEC ONNX failed:', e);
+        }
+
+        // ImageNet small CTM (1.3MB)
+        let imagenetSession = null;
+        try {
+            imagenetSession = await ort.InferenceSession.create('assets/hebbian/ctm_small.onnx', {
+                executionProviders: ['wasm'],
+            });
+            console.log('ImageNet ONNX loaded');
+        } catch (e) {
+            console.warn('ImageNet ONNX failed:', e);
+        }
+
+        status.textContent = 'Models loaded. Loading WASM...';
+
+        // 2. Expose REAL inference to Rust
+        // QEC inference — runs real ONNX model
+        // Returns: {prediction: int, predictions_all_ticks: [4*16]}
+        window.qecInfer = async function(syndromeFloat32Array) {
+            if (!qecSession) return null;
+            const tensor = new ort.Tensor('float32', syndromeFloat32Array, [1, 120]);
+            const results = await qecSession.run({ syndrome: tensor });
+            // predictions shape: [1, 4, 16] — pick argmax of last tick
+            const preds = results.predictions.data; // Float32Array length 64 (1*4*16)
+            // Last tick = indices 60-63 (tick 15, 4 classes)
+            let maxVal = -Infinity, maxIdx = 0;
+            for (let c = 0; c < 4; c++) {
+                const val = preds[c * 16 + 15]; // class c, tick 15
+                if (val > maxVal) { maxVal = val; maxIdx = c; }
+            }
+            return maxIdx;
+        };
+
+        // Batch QEC inference for Run N button
+        window.qecInferBatch = async function(syndromesFlat, batchSize) {
+            if (!qecSession) return null;
+            const results = [];
+            for (let i = 0; i < batchSize; i++) {
+                const syn = syndromesFlat.slice(i * 120, (i + 1) * 120);
+                const tensor = new ort.Tensor('float32', syn, [1, 120]);
+                const out = await qecSession.run({ syndrome: tensor });
+                const preds = out.predictions.data;
+                let maxVal = -Infinity, maxIdx = 0;
+                for (let c = 0; c < 4; c++) {
+                    const val = preds[c * 16 + 15];
+                    if (val > maxVal) { maxVal = val; maxIdx = c; }
+                }
+                results.push(maxIdx);
+            }
+            return results;
+        };
+
+        window.imagenetInfer = async function(inputFloat32Array) {
+            if (!imagenetSession) return null;
+            const tensor = new ort.Tensor('float32', inputFloat32Array, [1, 1, 64]);
+            const results = await imagenetSession.run({ input: tensor });
+            return {
+                predictions: Array.from(results.predictions.data),
+                sync: Array.from(results.sync.data),
+            };
+        };
+
+        // 3. Load Rust/WASM Hebbian engine
+        import init from './pkg/ctm_debugger.js';
+        try {
+            status.textContent = 'Loading Hebbian engine + data (~41MB)...';
+            await init();
+            document.getElementById('loading').style.display = 'none';
+        } catch (e) {
+            status.textContent = 'Error: ' + e.message;
+            console.error(e);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CTM Inference Time-Travel Debugger</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; background: #08080c; color: #b0b0b8;
+             font-family: 'Inter', -apple-system, system-ui, sans-serif; font-size: 12px; overflow: hidden; }
+
+/* Layout */
+.container { display: grid; grid-template-rows: auto auto 1fr auto; height: 100vh; }
+
+/* Header */
+.header { padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
+          background: linear-gradient(180deg, #0e0e14 0%, #0a0a10 100%);
+          border-bottom: 1px solid rgba(255,255,255,0.04); }
+.header-left { display: flex; align-items: center; gap: 16px; }
+.header h1 { font-size: 15px; font-weight: 700; letter-spacing: 0.5px;
+             background: linear-gradient(135deg, #4ade80, #22d3ee); -webkit-background-clip: text;
+             -webkit-text-fill-color: transparent; }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.header-right span { color: #555; font-size: 11px; font-family: 'SF Mono', monospace; }
+.header-right .v { color: #4ade80; }
+.header-right .v.err { color: #f87171; }
+
+/* Info bar */
+.info-bar { padding: 10px 24px; background: rgba(74,222,128,0.03);
+            border-bottom: 1px solid rgba(255,255,255,0.03);
+            display: flex; gap: 24px; font-size: 11px; color: #666; overflow-x: auto; }
+.info-bar .item { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.info-bar .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.info-bar a { color: #4ade80; text-decoration: none; }
+.info-bar a:hover { text-decoration: underline; }
+
+/* Main area */
+.main { display: grid; grid-template-columns: 1fr 260px; overflow: hidden; }
+
+/* Canvas */
+canvas { width: 100%; height: 100%; display: block; }
+
+/* Right panel */
+.panel { background: #0a0a10; border-left: 1px solid rgba(255,255,255,0.04);
+         padding: 16px; overflow-y: auto; }
+.panel section { margin-bottom: 16px; }
+.panel h2 { font-size: 9px; color: #444; text-transform: uppercase; letter-spacing: 1.5px;
+            margin-bottom: 8px; font-weight: 600; }
+
+/* Prediction cells */
+.pred-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; }
+.pred-cell { text-align: center; padding: 8px 2px; border-radius: 4px; font-size: 13px;
+             font-family: 'SF Mono', monospace; transition: all 0.2s; }
+.pred-cell .prob { font-size: 9px; opacity: 0.7; margin-top: 2px; }
+.pred-cell.hit { background: rgba(74,222,128,0.12); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }
+.pred-cell.miss { background: rgba(248,113,113,0.12); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+.pred-cell.true-label { background: rgba(251,191,36,0.08); color: #fbbf24;
+                        border: 1px solid rgba(251,191,36,0.2); }
+.pred-cell.off { background: rgba(255,255,255,0.02); color: #333; border: 1px solid rgba(255,255,255,0.04); }
+
+/* Metric rows */
+.metric { display: flex; justify-content: space-between; align-items: center;
+          padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+.metric .label { color: #555; font-size: 10px; }
+.metric .value { font-family: 'SF Mono', monospace; font-size: 13px; }
+
+/* Gap bar */
+.bar-track { height: 4px; background: rgba(255,255,255,0.04); border-radius: 2px;
+             overflow: hidden; margin: 6px 0; }
+.bar-fill { height: 100%; border-radius: 2px; transition: width 0.25s ease; }
+
+/* Per-tick prediction ribbon */
+.ribbon { display: flex; gap: 1px; margin-top: 4px; }
+.ribbon-cell { flex: 1; height: 20px; display: flex; align-items: center; justify-content: center;
+               font-size: 9px; font-family: 'SF Mono', monospace; border-radius: 2px;
+               cursor: default; transition: all 0.15s; }
+
+/* Timeline */
+.timeline { padding: 8px 24px; background: #0a0a10;
+            border-top: 1px solid rgba(255,255,255,0.04);
+            display: flex; align-items: center; gap: 10px; }
+.timeline .controls { display: flex; gap: 4px; }
+.timeline button { background: rgba(255,255,255,0.04); color: #888; border: 1px solid rgba(255,255,255,0.06);
+    padding: 6px 12px; font: 12px 'SF Mono', monospace; cursor: pointer; border-radius: 4px;
+    transition: all 0.15s; }
+.timeline button:hover { border-color: rgba(74,222,128,0.3); color: #fff; background: rgba(74,222,128,0.06); }
+.ticks { flex: 1; display: flex; gap: 2px; }
+.tick-cell { flex: 1; height: 32px; border-radius: 3px; cursor: pointer;
+             display: flex; flex-direction: column; align-items: center; justify-content: center;
+             transition: all 0.1s; }
+.tick-cell:hover { background: rgba(255,255,255,0.04); }
+.tick-cell.active { background: rgba(74,222,128,0.08); border-bottom: 2px solid #4ade80; }
+.tick-cell .tl { font-size: 8px; color: #333; }
+.tick-cell .tp { font-size: 11px; font-weight: 600; font-family: 'SF Mono', monospace; }
+
+/* Actions */
+.actions { display: flex; gap: 6px; }
+.actions button { background: rgba(74,222,128,0.08); color: #4ade80;
+                  border: 1px solid rgba(74,222,128,0.15); padding: 5px 14px;
+                  font: 11px 'Inter', sans-serif; cursor: pointer; border-radius: 4px;
+                  transition: all 0.15s; }
+.actions button:hover { background: rgba(74,222,128,0.15); border-color: rgba(74,222,128,0.3); }
+</style>
+</head>
+<body>
+<div class="container">
+    <!-- Header -->
+    <div class="header">
+        <div class="header-left">
+            <h1>ctmdebug</h1>
+            <div class="actions">
+                <button id="btn-new">New Syndrome</button>
+                <button id="btn-run100">Run 100</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;margin-left:8px;">
+                <span style="color:#fbbf24;font-size:10px;">correction α</span>
+                <input type="range" id="alpha-slider" min="0" max="50" value="5"
+                    style="width:80px;accent-color:#fbbf24;">
+                <span id="alpha-val" style="color:#fbbf24;font-size:11px;font-family:monospace;min-width:32px;">0.05</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <span>tick <span class="v" id="s-tick">—</span>/15</span>
+            <span>pred <span class="v" id="s-pred">—</span></span>
+            <span>loss <span class="v" id="s-loss">—</span></span>
+            <span>base <span class="v" id="s-base-acc">—</span></span>
+            <span>corr <span class="v" id="s-corr-acc" style="color:#fbbf24;">—</span></span>
+            <span id="status" style="color:#555">loading...</span>
+            <button id="btn-info" style="background:rgba(255,255,255,0.04);color:#888;border:1px solid rgba(255,255,255,0.08);
+                padding:3px 10px;font:11px inherit;cursor:pointer;border-radius:3px;">?</button>
+        </div>
+    </div>
+
+    <!-- Info bar -->
+    <div class="info-bar">
+        <div class="item"><div class="dot" style="background:#4ade80;"></div>
+            <span>d=5 surface code</span></div>
+        <div class="item"><div class="dot" style="background:#60a5fa;"></div>
+            <span>16 ticks</span></div>
+        <div class="item"><div class="dot" style="background:#fbbf24;"></div>
+            <span>Cholesky correction α=<span id="info-alpha">0</span></span></div>
+        <div class="item">
+            <a href="https://github.com/rotkonetworks/continuous-thought-machines/tree/bounds-analysis" target="_blank">src</a></div>
+    </div>
+
+    <!-- Info Modal -->
+    <div id="info-modal" style="display:none; position:fixed; inset:0; z-index:100;
+         background:rgba(0,0,0,0.85); overflow-y:auto;" onclick="if(event.target===this)this.style.display='none'">
+        <div style="max-width:580px; margin:40px auto; padding:28px; background:#0d0d15;
+             border:1px solid rgba(255,255,255,0.06); border-radius:6px; line-height:1.7; font-size:12px; color:#777;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <span style="font-size:14px;color:#ccc;">About</span>
+                <button onclick="document.getElementById('info-modal').style.display='none'"
+                    style="background:none;border:1px solid #222;color:#555;padding:3px 10px;cursor:pointer;border-radius:3px;font-size:11px;">esc</button>
+            </div>
+
+            <p>Time-travel debugger for <a href="https://arxiv.org/abs/2505.05522" style="color:#60a5fa;">Continuous Thought Machines</a>.
+            Step through 16 thinking ticks on a d=5 surface code QEC decoder (278K params, ONNX inference in browser).</p>
+
+            <p style="margin-top:12px;"><span style="color:#fbbf24;">Forward correction</span> —
+            At each tick, compute optimal NLM weights via Cholesky least-squares on trace history.
+            Nudge activations toward optimal by α. Based on
+            <a href="https://arxiv.org/abs/2208.04411" style="color:#60a5fa;">Angeris (2022)</a> SDP bound framework.
+            The Cholesky solver runs inside the ONNX graph — no external computation.</p>
+
+            <p style="margin-top:12px;"><span style="color:#22d3ee;">Hebbian plasticity</span> —
+            CTM sync signal (pairwise neuron products) is a natural substrate for
+            <a href="https://en.wikipedia.org/wiki/Hebbian_theory#Relationship_to_unsupervised_learning,_stability,_and_generalization" style="color:#60a5fa;">Hebbian learning</a>.
+            The forward correction is a principled formulation where the SDP bound provides
+            the optimization target. Open problem: finding a regulation mechanism where
+            correction consistently improves accuracy. The α slider lets you explore this.</p>
+
+            <p style="margin-top:12px;"><span style="color:#ccc;">Controls:</span>
+            New Syndrome → generate + infer. Arrow keys or ▶ to step ticks.
+            α slider for correction strength. Run 100 compares base (α=0) vs corrected.</p>
+
+            <p style="margin-top:16px;font-size:10px;color:#444;">
+            <a href="https://arxiv.org/abs/2505.05522" style="color:#555;">CTM</a> ·
+            <a href="https://arxiv.org/abs/2208.04411" style="color:#555;">Angeris</a> ·
+            <a href="https://github.com/rotkonetworks/continuous-thought-machines/tree/bounds-analysis" style="color:#555;">code</a></p>
+        </div>
+    </div>
+
+    <!-- Main -->
+    <div class="main">
+        <canvas id="c"></canvas>
+        <div class="panel">
+            <section>
+                <h2>Prediction at tick <span id="panel-tick">0</span></h2>
+                <div class="pred-grid" id="pred-grid"></div>
+            </section>
+
+            <section>
+                <h2>Metrics</h2>
+                <div class="metric">
+                    <span class="label">Loss</span>
+                    <span class="value" id="m-loss" style="color:#f87171;">—</span>
+                </div>
+                <div class="metric">
+                    <span class="label">Gap (uncertainty)</span>
+                    <span class="value" id="m-gap" style="color:#fbbf24;">—</span>
+                </div>
+                <div class="bar-track">
+                    <div class="bar-fill" id="gap-fill" style="width:0%;background:#fbbf24;"></div>
+                </div>
+                <div class="metric">
+                    <span class="label">Correct</span>
+                    <span class="value" id="m-correct">—</span>
+                </div>
+            </section>
+
+            <section>
+                <h2>Per-tick values</h2>
+                <table style="width:100%;font-size:9px;font-family:'SF Mono',monospace;border-collapse:collapse;" id="tick-table">
+                    <tr style="color:#444;"><td>t</td><td>pred</td><td>loss</td><td>gap</td><td>logits</td></tr>
+                </table>
+            </section>
+
+            <section>
+                <h2>Trajectory</h2>
+                <div class="ribbon" id="ribbon"></div>
+                <div style="margin-top:6px;font-size:9px;color:#444;" id="trajectory-text"></div>
+            </section>
+
+            <section>
+                <h2>Loss / Gap</h2>
+                <canvas id="loss-chart" width="220" height="60" style="width:100%; border-radius:4px;
+                    background:rgba(255,255,255,0.02);"></canvas>
+            </section>
+
+        </div>
+    </div>
+
+    <!-- Timeline -->
+    <div class="timeline">
+        <div class="controls">
+            <button id="btn-prev">◀</button>
+            <button id="btn-play">▶</button>
+            <button id="btn-next">▶</button>
+        </div>
+        <div class="ticks" id="ticks"></div>
+    </div>
+</div>
+
+<script>
+const CLASSES = ['I','X','Z','Y'];
+const CLASS_COLORS = {hit:'#4ade80', miss:'#f87171', label:'#fbbf24'};
+let session = null, currentTick = 0, tickData = null;
+let stats = {total:0, correct:0, baseTotal:0, baseCorrect:0, corrTotal:0, corrCorrect:0};
+let playing = false, playTimer = null;
+
+async function init() {
+    try {
+        session = await ort.InferenceSession.create('assets/hebbian/qec_decoder_v3.onnx',
+            {executionProviders:['wasm']});
+        document.getElementById('status').textContent = 'ready';
+        document.getElementById('status').style.color = '#4ade80';
+    } catch(e) {
+        document.getElementById('status').textContent = 'onnx error';
+        document.getElementById('status').style.color = '#f87171';
+    }
+    buildUI();
+}
+
+function buildUI() {
+    // Tick bar
+    const bar = document.getElementById('ticks');
+    for (let t = 0; t < 16; t++) {
+        const el = document.createElement('div');
+        el.className = 'tick-cell';
+        el.innerHTML = `<span class="tl">t${t}</span><span class="tp">·</span>`;
+        el.onclick = () => { currentTick = t; render(); };
+        bar.appendChild(el);
+    }
+    // Ribbon
+    const rib = document.getElementById('ribbon');
+    for (let t = 0; t < 16; t++) {
+        const el = document.createElement('div');
+        el.className = 'ribbon-cell';
+        el.textContent = '·';
+        rib.appendChild(el);
+    }
+
+    window._correctionAlpha = 0.05;
+    const alphaSlider = document.getElementById('alpha-slider');
+    const alphaValEl = document.getElementById('alpha-val');
+    alphaSlider.oninput = () => {
+        window._correctionAlpha = alphaSlider.value / 100;
+        alphaValEl.textContent = window._correctionAlpha.toFixed(2);
+        const ia = document.getElementById('info-alpha');
+        if (ia) ia.textContent = window._correctionAlpha.toFixed(2);
+    };
+
+    document.getElementById('btn-new').onclick = newSyndrome;
+    document.getElementById('btn-run100').onclick = run100;
+    document.getElementById('btn-info').onclick = () => {
+        document.getElementById('info-modal').style.display = 'block';
+    };
+    document.getElementById('btn-prev').onclick = () => { if(currentTick>0){currentTick--;render();}};
+    document.getElementById('btn-next').onclick = () => { if(currentTick<15){currentTick++;render();}};
+    document.getElementById('btn-play').onclick = togglePlay;
+    document.addEventListener('keydown', e => {
+        if (e.key==='ArrowLeft' && currentTick>0) { currentTick--; render(); }
+        if (e.key==='ArrowRight' && currentTick<15) { currentTick++; render(); }
+        if (e.key===' ') { e.preventDefault(); togglePlay(); }
+    });
+}
+
+function generateSyndrome() {
+    // Full 5-round syndrome — replicates Python surface_code.py exactly
+    const d=5, n=25, p=0.05, R=5, nStab=24, nX=12;
+
+    // Parity checks — same construction as SurfaceCode.__init__
+    const hx=[], hz=[];
+    for(let r=0;r<d-1;r++) for(let c=0;c<d-1;c++) {
+        const f=[r*d+c, r*d+c+1, (r+1)*d+c, (r+1)*d+c+1];
+        if((r+c)%2===0) hx.push(f); else hz.push(f);
+    }
+    for(let c=0;c<d-1;c+=2) hz.push([c, c+1]);
+    for(let c=1;c<d-1;c+=2) hz.push([(d-1)*d+c, (d-1)*d+c+1]);
+    for(let r=0;r<d-1;r+=2) hx.push([r*d, (r+1)*d]);
+    for(let r=1;r<d-1;r+=2) hx.push([r*d+d-1, (r+1)*d+d-1]);
+    while(hx.length>nX) hx.pop();
+    while(hz.length>nX) hz.pop();
+
+    const logX=[],logZ=[];
+    for(let c=0;c<d;c++) logX.push(c);
+    for(let r=0;r<d;r++) logZ.push(r*d);
+
+    const totX=new Uint8Array(n), totZ=new Uint8Array(n);
+    const syn=new Float32Array(R*nStab);
+    let lastXErr=new Uint8Array(n), lastZErr=new Uint8Array(n);
+
+    for(let round=0;round<R;round++) {
+        for(let q=0;q<n;q++) if(Math.random()<p) {
+            const t=Math.floor(Math.random()*3);
+            if(t===0||t===1){totX[q]^=1;lastXErr[q]=1;}
+            if(t===2||t===1){totZ[q]^=1;lastZErr[q]=1;}
+        }
+        const off=round*nStab;
+        for(let si=0;si<hx.length;si++){let par=0;hx[si].forEach(q=>{par^=totZ[q];});syn[off+si]=par;}
+        for(let si=0;si<hz.length;si++){let par=0;hz[si].forEach(q=>{par^=totX[q];});syn[off+nX+si]=par;}
+        for(let si=0;si<nStab;si++) if(Math.random()<p) syn[off+si]=1-syn[off+si];
+    }
+
+    let xLog=0,zLog=0;
+    logZ.forEach(q=>{xLog^=totX[q];});
+    logX.forEach(q=>{zLog^=totZ[q];});
+
+    return {syndrome:syn, label:xLog+2*zLog, xErr:lastXErr, zErr:lastZErr,
+            synBits:Array.from(syn.slice((R-1)*nStab, R*nStab))};
+}
+
+async function runInference(syn) {
+    if (!session) return null;
+    const alphaVal = window._correctionAlpha || 0; const out = await session.run({syndrome: new ort.Tensor('float32', syn, [1,120]), alpha: new ort.Tensor('float32', new Float32Array([alphaVal]), [1])});
+    const raw = out.predictions.data;
+    const gapsRaw = out.gaps ? Array.from(out.gaps.data) : null;
+    const preds = [];
+    for(let c=0;c<4;c++) { const row=[]; for(let t=0;t<16;t++) row.push(raw[c*16+t]); preds.push(row); }
+    return {preds, gaps: gapsRaw};
+}
+
+async function newSyndrome() {
+    const s = generateSyndrome();
+    const result = await runInference(s.syndrome);
+    if (!result) return;
+    const {preds, gaps} = result;
+    const ticks = [];
+    for (let t=0;t<16;t++) {
+        const logits = preds.map(r=>r[t]);
+        const maxL = Math.max(...logits);
+        const exps = logits.map(l=>Math.exp(l-maxL));
+        const sum = exps.reduce((a,b)=>a+b);
+        const probs = exps.map(e=>e/sum);
+        const pred = logits.indexOf(maxL);
+        const loss = -Math.log(probs[s.label]+1e-8);
+        // Use REAL gap from model (SDP-based) if available, else entropy proxy
+        const realGap = gaps ? gaps[t] : null;
+        const entropy = -probs.reduce((a,p)=>a+p*Math.log(p+1e-8),0);
+        const gap = realGap !== null ? realGap : entropy/Math.log(4);
+        ticks.push({pred, probs, loss, gap, realGap: realGap!==null, correct:pred===s.label});
+    }
+    tickData = {ticks, label:s.label, synBits:s.synBits, xErr:s.xErr, zErr:s.zErr};
+    stats.total++; if(ticks[15].correct) stats.correct++;
+    currentTick = 0; playing = false; clearInterval(playTimer);
+    document.getElementById('btn-play').textContent = '▶';
+    render();
+    // Auto-play
+    togglePlay();
+}
+
+async function run100() {
+    const el = document.getElementById('status');
+    el.textContent = 'running...'; el.style.color = '#fbbf24';
+    const savedAlpha = window._correctionAlpha;
+    for (let i=0;i<100;i++) {
+        const s = generateSyndrome();
+        // Run base (α=0)
+        window._correctionAlpha = 0;
+        const rBase = await runInference(s.syndrome);
+        if (!rBase) break;
+        const baseLogits = rBase.preds.map(r=>r[15]);
+        const basePred = baseLogits.indexOf(Math.max(...baseLogits));
+        stats.baseTotal++; if(basePred===s.label) stats.baseCorrect++;
+
+        // Run corrected (α=slider)
+        window._correctionAlpha = savedAlpha;
+        if (savedAlpha > 0) {
+            const rCorr = await runInference(s.syndrome);
+            if (!rCorr) break;
+            const corrLogits = rCorr.preds.map(r=>r[15]);
+            const corrPred = corrLogits.indexOf(Math.max(...corrLogits));
+            stats.corrTotal++; if(corrPred===s.label) stats.corrCorrect++;
+        }
+    }
+    window._correctionAlpha = savedAlpha;
+
+    const baseAcc = stats.baseTotal>0 ? (stats.baseCorrect/stats.baseTotal*100).toFixed(1)+'%' : '—';
+    const corrAcc = stats.corrTotal>0 ? (stats.corrCorrect/stats.corrTotal*100).toFixed(1)+'%' : '—';
+    document.getElementById('s-base-acc').textContent = baseAcc;
+    document.getElementById('s-corr-acc').textContent = corrAcc;
+    // acc display removed — use base/corr only
+    el.textContent = 'ready'; el.style.color = '#4ade80';
+}
+
+function togglePlay() {
+    playing = !playing;
+    document.getElementById('btn-play').textContent = playing ? '⏸' : '▶';
+    if (playing) {
+        if (currentTick >= 15) currentTick = 0;
+        playTimer = setInterval(() => {
+            currentTick++;
+            if (currentTick >= 16) { currentTick=15; playing=false;
+                document.getElementById('btn-play').textContent='▶'; clearInterval(playTimer); }
+            render();
+        }, 350);
+    } else clearInterval(playTimer);
+}
+
+function render() {
+    if (!tickData) return;
+    const t = currentTick, td = tickData.ticks[t];
+
+    // Header stats
+    document.getElementById('s-tick').textContent = t;
+    const pe = document.getElementById('s-pred');
+    pe.textContent = CLASSES[td.pred] + (td.correct?' ✓':' ✗');
+    pe.className = 'v' + (td.correct?'':' err');
+    document.getElementById('s-loss').textContent = td.loss.toFixed(3);
+    if (stats.baseTotal > 0)
+        document.getElementById('s-base-acc').textContent =
+            `${(stats.baseCorrect/stats.baseTotal*100).toFixed(1)}%`;
+    if (stats.corrTotal > 0)
+        document.getElementById('s-corr-acc').textContent =
+            `${(stats.corrCorrect/stats.corrTotal*100).toFixed(1)}%`;
+
+    // Panel tick
+    document.getElementById('panel-tick').textContent = t;
+
+    // Prediction grid
+    const pg = document.getElementById('pred-grid');
+    pg.innerHTML = '';
+    CLASSES.forEach((cls, i) => {
+        const prob = td.probs[i];
+        const isPred = i === td.pred, isLabel = i === tickData.label;
+        // Color intensity scales with probability
+        const intensity = Math.min(1, prob * 2);
+        let bg, fg, border;
+        if (isPred && td.correct) {
+            bg = `rgba(74,222,128,${0.05 + intensity * 0.2})`;
+            fg = `rgba(74,222,128,${0.4 + intensity * 0.6})`;
+            border = `rgba(74,222,128,${0.1 + intensity * 0.4})`;
+        } else if (isPred) {
+            bg = `rgba(248,113,113,${0.05 + intensity * 0.2})`;
+            fg = `rgba(248,113,113,${0.4 + intensity * 0.6})`;
+            border = `rgba(248,113,113,${0.1 + intensity * 0.4})`;
+        } else if (isLabel) {
+            bg = `rgba(251,191,36,${0.03 + prob * 0.15})`;
+            fg = `rgba(251,191,36,${0.3 + prob * 0.7})`;
+            border = `rgba(251,191,36,${0.1 + prob * 0.2})`;
+        } else {
+            bg = `rgba(255,255,255,${0.01 + prob * 0.08})`;
+            fg = `rgba(255,255,255,${0.15 + prob * 0.5})`;
+            border = `rgba(255,255,255,${0.02 + prob * 0.06})`;
+        }
+        pg.innerHTML += `<div class="pred-cell" style="background:${bg};color:${fg};border:1px solid ${border}">
+            <strong>${cls}</strong><div class="prob">${(prob*100).toFixed(1)}%</div></div>`;
+    });
+
+    // Metrics
+    document.getElementById('m-loss').textContent = td.loss.toFixed(4);
+    document.getElementById('m-loss').style.color = td.loss>1.2?'#f87171':td.loss>0.5?'#fbbf24':'#4ade80';
+    document.getElementById('m-gap').textContent = td.gap.toFixed(4);
+    document.getElementById('gap-fill').style.width = (td.gap*100)+'%';
+    document.getElementById('gap-fill').style.background = td.gap>0.7?'#f87171':td.gap>0.4?'#fbbf24':'#4ade80';
+    document.getElementById('m-correct').textContent = td.correct ? '✓ yes' : '✗ no';
+    document.getElementById('m-correct').style.color = td.correct ? '#4ade80' : '#f87171';
+
+    // Ribbon
+    const ribbon = document.querySelectorAll('.ribbon-cell');
+    tickData.ticks.forEach((tk, i) => {
+        const el = ribbon[i];
+        el.textContent = CLASSES[tk.pred];
+        el.style.background = i===t ? 'rgba(74,222,128,0.15)' :
+            tk.correct ? 'rgba(74,222,128,0.05)' : 'rgba(248,113,113,0.05)';
+        el.style.color = tk.correct ? '#4ade80' : '#f87171';
+        el.style.fontWeight = i===t ? '700' : '400';
+    });
+
+    // Per-tick values table
+    const tt = document.getElementById('tick-table');
+    tt.innerHTML = '<tr style="color:#444;border-bottom:1px solid rgba(255,255,255,0.04);"><td style="padding:2px 4px;">t</td><td>pred</td><td>loss</td><td>gap</td><td>I / X / Z / Y</td></tr>';
+    tickData.ticks.forEach((tk, i) => {
+        const active = i === t;
+        const bg = active ? 'background:rgba(74,222,128,0.06);' : '';
+        const clr = tk.correct ? '#4ade80' : '#f87171';
+        const logits = tk.probs.map(p => (p*100).toFixed(0)).join(' / ');
+        tt.innerHTML += `<tr style="${bg}font-size:9px;border-bottom:1px solid rgba(255,255,255,0.02);">
+            <td style="padding:1px 4px;color:#555;">${i}</td>
+            <td style="color:${clr};font-weight:${active?'700':'400'};">${CLASSES[tk.pred]}</td>
+            <td style="color:#888;">${tk.loss.toFixed(3)}</td>
+            <td style="color:#fbbf24;">${tk.gap.toFixed(3)}</td>
+            <td style="color:#555;font-size:8px;">${logits}</td></tr>`;
+    });
+
+    // Trajectory text
+    const changes = [];
+    for (let i=1;i<16;i++) if(tickData.ticks[i].pred !== tickData.ticks[i-1].pred)
+        changes.push(`t${i}: ${CLASSES[tickData.ticks[i-1].pred]}→${CLASSES[tickData.ticks[i].pred]}`);
+    document.getElementById('trajectory-text').textContent =
+        changes.length ? changes.join(', ') : 'No prediction changes across ticks';
+
+    // Loss chart
+    const lc = document.getElementById('loss-chart');
+    const lx = lc.getContext('2d');
+    const cw = 220, ch = 60;
+    lx.clearRect(0,0,cw,ch);
+    const maxL = Math.max(...tickData.ticks.map(t=>t.loss));
+    // Line
+    lx.beginPath(); lx.strokeStyle = 'rgba(255,255,255,0.2)'; lx.lineWidth = 1;
+    tickData.ticks.forEach((tk,i) => {
+        const x=i/15*(cw-10)+5, y=ch-4-(tk.loss/maxL)*(ch-8);
+        i===0 ? lx.moveTo(x,y) : lx.lineTo(x,y);
+    });
+    lx.stroke();
+    // Dots
+    tickData.ticks.forEach((tk,i) => {
+        const x=i/15*(cw-10)+5, y=ch-4-(tk.loss/maxL)*(ch-8);
+        lx.beginPath(); lx.arc(x,y,i===t?3:1.5,0,Math.PI*2);
+        lx.fillStyle = i===t ? '#4ade80' : tk.correct ? 'rgba(74,222,128,0.4)' : 'rgba(248,113,113,0.4)';
+        lx.fill();
+    });
+
+    // Tick bar
+    document.querySelectorAll('.tick-cell').forEach((el,i) => {
+        const tk = tickData.ticks[i];
+        el.className = 'tick-cell' + (i===t?' active':'');
+        el.querySelector('.tp').textContent = CLASSES[tk.pred];
+        el.querySelector('.tp').style.color = tk.correct ? '#4ade80' : '#f87171';
+    });
+
+    drawCanvas();
+}
+
+function drawCanvas() {
+    const canvas = document.getElementById('c');
+    const r = canvas.parentElement.getBoundingClientRect();
+    canvas.width = r.width * devicePixelRatio;
+    canvas.height = r.height * devicePixelRatio;
+    const ctx = canvas.getContext('2d'), W = canvas.width, H = canvas.height;
+    ctx.fillStyle = '#08080c'; ctx.fillRect(0,0,W,H);
+    if (!tickData) {
+        ctx.fillStyle = '#333'; ctx.font = `${14*devicePixelRatio}px Inter, sans-serif`;
+        ctx.textAlign = 'center'; ctx.fillText('Click "New Syndrome" to start', W/2, H/2);
+        return;
+    }
+
+    const t = currentTick, td = tickData.ticks[t], d = 5;
+
+    // ─── Left: Surface code lattice ─────────────────────
+    const lSize = Math.min(W*0.28, H*0.50);
+    const ox = W*0.18 - lSize/2, oy = H*0.40 - lSize/2;
+    const cw = lSize/d, ch = lSize/d;
+
+    // Grid lines (subtle)
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)'; ctx.lineWidth = 1;
+    for (let i=0; i<=d; i++) {
+        ctx.beginPath(); ctx.moveTo(ox+i*cw, oy); ctx.lineTo(ox+i*cw, oy+lSize); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(ox, oy+i*ch); ctx.lineTo(ox+lSize, oy+i*ch); ctx.stroke();
+    }
+
+    // Data qubits
+    for (let row=0;row<d;row++) for(let col=0;col<d;col++) {
+        const q=row*d+col, x=ox+(col+.5)*cw, y=oy+(row+.5)*ch;
+        const hasX=tickData.xErr[q], hasZ=tickData.zErr[q];
+        const color = hasX&&hasZ ? '#c084fc' : hasX ? '#f87171' : hasZ ? '#60a5fa' : 'rgba(255,255,255,0.08)';
+        const radius = (hasX||hasZ) ? cw*0.28 : cw*0.18;
+
+        // Glow for errors
+        if (hasX || hasZ) {
+            ctx.beginPath(); ctx.arc(x,y,radius*2,0,Math.PI*2);
+            ctx.fillStyle = color.replace(')', ',0.08)').replace('rgb','rgba');
+            ctx.fill();
+        }
+        ctx.beginPath(); ctx.arc(x,y,radius,0,Math.PI*2);
+        ctx.fillStyle = color; ctx.fill();
+    }
+
+    // Syndrome fires
+    tickData.synBits.forEach((fired,si) => {
+        if (!fired) return;
+        const row=Math.floor(si/4), col=si%4;
+        const x=ox+(col+1)*cw, y=oy+(row+.5)*ch;
+        ctx.fillStyle = si<12 ? 'rgba(251,191,36,0.4)' : 'rgba(34,211,238,0.4)';
+        const s = cw*0.15;
+        ctx.fillRect(x-s,y-s,s*2,s*2);
+    });
+
+    // Prediction
+    ctx.fillStyle = td.correct ? '#4ade80' : '#f87171';
+    ctx.font = `bold ${32*devicePixelRatio}px SF Mono, monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillText(CLASSES[td.pred], W*0.22, oy+lSize+44*devicePixelRatio);
+    ctx.font = `${10*devicePixelRatio}px Inter, sans-serif`;
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillText(`tick ${t}  ·  true: ${CLASSES[tickData.label]}`, W*0.22, oy+lSize+62*devicePixelRatio);
+
+    // Legend
+    const lx = ox, ly = oy + lSize + 85*devicePixelRatio;
+    const legends = [['#f87171','X error'],['#60a5fa','Z error'],['#c084fc','Y error'],
+                     ['rgba(251,191,36,0.5)','X-stab'],['rgba(34,211,238,0.5)','Z-stab']];
+    legends.forEach(([c,l],i) => {
+        const x=lx+(i%3)*100*devicePixelRatio, y=ly+Math.floor(i/3)*16*devicePixelRatio;
+        ctx.beginPath(); ctx.arc(x+4,y+4,3,0,Math.PI*2); ctx.fillStyle=c; ctx.fill();
+        ctx.fillStyle='rgba(255,255,255,0.25)'; ctx.font=`${9*devicePixelRatio}px Inter`;
+        ctx.textAlign='left'; ctx.fillText(l,x+12,y+7);
+    });
+
+    // ─── Right: Per-tick bars ───────────────────────────
+    const tx=W*0.52, tw=W*0.43, ty=H*0.08, th=H*0.78;
+    const maxLoss = Math.max(...tickData.ticks.map(t=>t.loss));
+    const maxGap = Math.max(...tickData.ticks.map(t=>t.gap));
+
+    // Axis
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(tx,ty); ctx.lineTo(tx,ty+th); ctx.lineTo(tx+tw,ty+th); ctx.stroke();
+
+    // Loss bars + gap overlay
+    const barW = tw / 16 * 0.6;
+    tickData.ticks.forEach((tk,i) => {
+        const x = tx + (i+0.5)/16 * tw;
+        const lossH = (tk.loss/maxLoss) * th * 0.7;
+        const gapH = (tk.gap/maxGap) * th * 0.25;
+        const isActive = i===t;
+
+        // Loss bar
+        const alpha = isActive ? 0.8 : 0.2;
+        ctx.fillStyle = tk.correct ?
+            `rgba(74,222,128,${alpha})` : `rgba(248,113,113,${alpha})`;
+        ctx.fillRect(x-barW/2, ty+th-lossH, barW, lossH);
+
+        // Gap bar (stacked on top)
+        ctx.fillStyle = `rgba(251,191,36,${isActive?0.5:0.1})`;
+        ctx.fillRect(x-barW*0.7, ty+th-lossH-gapH-2, barW*1.4, gapH);
+
+        // Active highlight
+        if (isActive) {
+            ctx.strokeStyle = 'rgba(74,222,128,0.3)'; ctx.lineWidth = 1;
+            ctx.strokeRect(x-barW, ty, barW*2, th);
+        }
+    });
+
+    // Loss line
+    ctx.beginPath(); ctx.strokeStyle='rgba(255,255,255,0.3)'; ctx.lineWidth=1.5;
+    tickData.ticks.forEach((tk,i) => {
+        const x=tx+(i+0.5)/16*tw, y=ty+th-(tk.loss/maxLoss)*th*0.7;
+        i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }); ctx.stroke();
+
+    // Labels
+    ctx.fillStyle='rgba(255,255,255,0.15)'; ctx.font=`${9*devicePixelRatio}px Inter`;
+    ctx.textAlign='left';
+    ctx.fillText('loss', tx+3, ty-4);
+    ctx.fillStyle='rgba(251,191,36,0.25)';
+    ctx.fillText('gap', tx+tw-30*devicePixelRatio, ty-4);
+    ctx.fillStyle='rgba(255,255,255,0.1)';
+    ctx.textAlign='center';
+    ctx.fillText('thinking ticks →', tx+tw/2, ty+th+18*devicePixelRatio);
+}
+
+init();
+</script>
+</body>
+</html>
